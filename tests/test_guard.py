@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from spotimix.guard import write_block_reason
+from src.guard import write_block_reason
 
 
 class GuardTest(unittest.TestCase):

@@ -2,7 +2,7 @@
 # Paths are relative to this file unless absolute.
 
 # The Spotify playlist that holds your mixed transitions (must be one you own).
-playlist_url: "https://open.spotify.com/playlist/REPLACE_WITH_YOUR_PLAYLIST_ID"
+playlist_url: "https://open.spotify.com/playlist/0jkL0VgonmSBWLS4PwONrx?si=8768fc5665ce4147"
 
 paths:
   # Persistent browser profile. Your Spotify login lives here (cookies only;
@@ -10,17 +10,35 @@ paths:
   browser_profile: ".browser-profile"
   # All captures, reports and generated files go here.
   output_dir: "output"
+  # Folder holding your own audio files. Phase 0 downloads into it, Phase 3
+  # matches the mix against it. null = you must pass --music-dir to Phase 3.
+  music_dir: "C:/Users/Nitzan Avargil/Music/Phonk Pauochi"
 
 browser:
+  # "desktop" drives the Spotify desktop app over the Chrome DevTools Protocol.
+  # Use it: the mix / transition editor only exists there, not in the web player.
+  # "web" opens the web player in a Playwright browser instead.
+  target: desktop
+
+  # --- desktop target ---
+  # DevTools port Spotify is started on. Only read on a cold start, so a
+  # already-running Spotify has to be restarted (--close-spotify does it).
+  cdp_port: 9222
+  # Path to Spotify.exe. null = look in the usual places, including the
+  # Microsoft Store app-execution alias in WindowsApps.
+  spotify_exe: null
+
+  # --- web target ---
   # null = Playwright's bundled Chromium. "chrome" or "msedge" = your installed
   # browser, which is closer to what Spotify expects (e.g. DRM for playback).
   channel: null
+
   # Slows every Playwright action down (ms). Keeps us gentle on Spotify.
   slow_mo_ms: 250
 
 discovery:
   # Abort requests that would modify playlists or your library while we
-  # record (see spotimix/guard.py). Leave this on.
+  # record (see src/guard.py). Leave this on.
   block_playlist_writes: true
   # Only responses from these hosts (and subdomains) have bodies saved.
   capture_hosts:

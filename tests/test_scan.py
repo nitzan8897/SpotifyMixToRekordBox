@@ -2,8 +2,8 @@ import re
 import unittest
 
 from phase1_discover import js_keyword_pattern
-from spotimix.scan import (compile_keywords, endpoint_template, get_at, match_key, parent_path,
-                           redact, scan_json, tokenize)
+from src.scan import (compile_keywords, endpoint_template, get_at, match_key, parent_path,
+                      redact, scan_json, tokenize)
 
 KW = compile_keywords(["transition", "crossfade", "fade", "start_ms", "eq", "mix", "filter"])
 

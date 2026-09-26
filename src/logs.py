@@ -23,4 +23,4 @@ def setup_logging(log_file: Path | None = None, verbose: bool = False) -> loggin
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
         root.addHandler(fh)
 
-    return logging.getLogger("spotimix")
+    return logging.getLogger("src")

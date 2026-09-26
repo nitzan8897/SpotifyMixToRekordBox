@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """Phase 1 - Discovery.
 
-Opens the Spotify web player in a headed browser with a persistent profile,
-lets you log in by hand, opens the playlist from config.yaml, and records:
+Records a real, logged-in Spotify session while you click through your mixed
+playlist. Two targets:
 
-  * a HAR file with embedded response bodies (network.har)
+  desktop  the Spotify desktop app, driven over the Chrome DevTools Protocol
+           (src/desktop.py). This is what config.yaml ships with: the
+           mix / transition editor is not in the web player.
+  web      the web player in a headed browser with a persistent profile,
+           which you log into by hand.
+
+Pick one with browser.target in config.yaml, or --target on the command line.
+
+Either way it opens the playlist from config.yaml and records:
+
+  * a HAR file with embedded response bodies (network.har; web target only)
   * every Spotify response body on its own (bodies/) plus an index
   * WebSocket frames (ws_frames.jsonl)
   * DOM snapshots of the mix/transition editor, taken on your command
@@ -15,8 +25,9 @@ to search the capture and write the discovery report.
 Safety:
   * Your password is typed into Spotify's own login page; this script never
     reads it. Only the browser profile (cookies) is kept, in the profile dir.
+    The desktop target reuses the app's existing sign-in and asks for nothing.
   * Requests that would modify playlists / your library are aborted
-    (spotimix/guard.py). Don't click Save/Apply in the editor anyway.
+    (src/guard.py). Don't click Save/Apply in the editor anyway.
   * No audio is downloaded: audio/media responses are never saved.
 """
 from __future__ import annotations
@@ -33,14 +44,15 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from spotimix.config import ConfigError, load_config
-from spotimix.guard import graphql_operation_name, is_suspicious_transition_post, write_block_reason
-from spotimix.logs import setup_logging
-from spotimix.scan import endpoint_template
+from src import desktop
+from src.config import TARGETS, ConfigError, load_config
+from src.guard import graphql_operation_name, is_suspicious_transition_post, write_block_reason
+from src.logs import setup_logging
+from src.scan import endpoint_template
 
-log = logging.getLogger("spotimix.discover")
+log = logging.getLogger("src.discover")
 
-DOM_PROBE_JS = (Path(__file__).parent / "spotimix" / "dom_probe.js").read_text(encoding="utf-8")
+DOM_PROBE_JS = (Path(__file__).parent / "src" / "dom_probe.js").read_text(encoding="utf-8")
 
 # Labels that may open a mix/transition editor, and labels we never click.
 OPEN_WORDS = ["mix", "mixed", "transition", "transitions", "crossfade", "blend", "segue", "automix"]
@@ -55,12 +67,14 @@ TEXT_TYPES = ("json", "text/", "javascript", "xml", "protobuf", "x-protobuf", "g
 
 COMMANDS_HELP = """
   Commands (type then Enter):
+    a        walk EVERY transition automatically: open each, preview it so the
+             player reports its curves, snapshot it. Open the mix editor first.
     s        snapshot the DOM now (do this with the transition editor OPEN,
              once per transition you inspect)
     c        list buttons that might open a mix/transition editor
     o N      click candidate N from the last 'c' list (safe labels only)
     p        re-open the playlist page
-    q        finish: close the browser and write all files
+    q        finish: stop recording and write all files
 """
 
 
@@ -229,7 +243,7 @@ async def ainput(prompt: str) -> str:
     return await asyncio.to_thread(input, prompt)
 
 
-async def wait_for_login(context) -> None:
+async def wait_for_web_login(context) -> None:
     print("\n=== Log in to Spotify in the browser window ===\n"
           "Type your credentials into Spotify's own page. This script never sees them.\n"
           "If you are already logged in (profile reused), just press Enter.")
@@ -244,6 +258,32 @@ async def wait_for_login(context) -> None:
         if (await ainput("Enter / skip: ")).strip().lower() == "skip":
             log.warning("Continuing without confirmed login.")
             return
+
+
+async def wait_for_desktop_login(page) -> None:
+    """The desktop app carries its own sign-in; just confirm it is signed in."""
+    if await desktop.is_logged_in(page):
+        log.info("Spotify desktop is signed in.")
+        return
+    print("\n=== Sign in to the Spotify desktop app ===\n"
+          "Use the Spotify window itself. This script never sees your password.")
+    while True:
+        await ainput("Press Enter once the app shows your library... ")
+        if await desktop.is_logged_in(page):
+            log.info("Spotify desktop is signed in.")
+            return
+        log.warning("Still not signed in (no user widget in the app window).")
+        if (await ainput("Enter / skip: ")).strip().lower() == "skip":
+            log.warning("Continuing without confirmed sign-in.")
+            return
+
+
+async def goto_playlist(cfg, page) -> None:
+    """Show the configured playlist, the way this target needs it shown."""
+    if cfg.is_desktop:
+        await desktop.navigate_to_playlist(page, cfg.playlist_id)
+    else:
+        await page.goto(cfg.playlist_url, wait_until="domcontentloaded")
 
 
 async def snapshot_dom(page, run_dir: Path, label: str, patterns: dict) -> dict | None:
@@ -273,7 +313,77 @@ async def snapshot_dom(page, run_dir: Path, label: str, patterns: dict) -> dict 
     return results[0] if results else None
 
 
-async def run(cfg, run_dir: Path) -> int:
+async def _wire_recorder(context, rec) -> None:
+    """Route every request through the write guard and record every response."""
+    await context.route("**/*", rec.route)
+    context.on("response", rec.on_response)
+    context.on("page", lambda p: p.on("websocket", rec.on_websocket))
+    for p in context.pages:
+        p.on("websocket", rec.on_websocket)
+
+
+async def open_web_session(pw, cfg, rec, run_dir: Path):
+    """Headed browser on open.spotify.com. Returns (context, page, finish)."""
+    cfg.browser_profile.mkdir(parents=True, exist_ok=True)
+    log.info("Launching headed browser (profile: %s)", cfg.browser_profile)
+    context = await pw.chromium.launch_persistent_context(
+        user_data_dir=str(cfg.browser_profile),
+        channel=cfg.browser_channel,
+        headless=False,
+        slow_mo=cfg.slow_mo_ms,
+        viewport={"width": 1400, "height": 900},
+        record_har_path=str(run_dir / "network.har"),
+        record_har_content="embed",
+        # Requests made by a service worker would bypass our recorder and write guard.
+        service_workers="block",
+    )
+    await _wire_recorder(context, rec)
+    page = context.pages[0] if context.pages else await context.new_page()
+    await page.goto("https://open.spotify.com/", wait_until="domcontentloaded")
+    await wait_for_web_login(context)
+
+    async def finish():
+        log.info("Closing browser and writing HAR (this can take a moment)...")
+        await context.close()
+
+    return context, page, finish
+
+
+async def open_desktop_session(pw, cfg, rec, args):
+    """Spotify desktop over CDP. Returns (context, page, finish).
+
+    No HAR here: record_har_path only applies to a context we create, and this
+    one already exists inside the running app. index.jsonl and bodies/ are
+    written exactly as on the web target, which is all the analyzer reads.
+    """
+    desktop.start_and_attach_preflight(cfg.spotify_exe, cfg.cdp_port,
+                                       close_running=args.close_spotify, attach_only=args.attach)
+    log.info("%s", desktop.describe_environment(cfg.cdp_port))
+    browser, context, page = await desktop.attach(pw, cfg.cdp_port, cfg.slow_mo_ms)
+    await _wire_recorder(context, rec)  # the app page is already in context.pages
+
+    if not args.no_reload:
+        # We attach after the app has already booted, so its startup requests and
+        # the dealer WebSocket are long gone. Reloading xpui replays all of it
+        # with the recorder listening. It does not sign you out.
+        log.info("Reloading the Spotify UI so its startup traffic is recorded...")
+        await page.reload(wait_until="domcontentloaded")
+        await page.wait_for_timeout(9000)
+
+    await wait_for_desktop_login(page)
+
+    async def finish():
+        log.info("Disconnecting from Spotify. The app stays open.")
+        try:
+            await context.unroute_all(behavior="ignoreErrors")
+        except Exception as e:  # older Playwright, or already disconnected
+            log.debug("unroute_all failed: %s", e)
+        await browser.close()
+
+    return context, page, finish
+
+
+async def run(cfg, run_dir: Path, args) -> int:
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -287,51 +397,45 @@ async def run(cfg, run_dir: Path) -> int:
         "openPattern": js_keyword_pattern(OPEN_WORDS),
         "unsafePattern": js_keyword_pattern(UNSAFE_WORDS),
     }
-    har_path = run_dir / "network.har"
-    cfg.browser_profile.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as pw:
-        log.info("Launching headed browser (profile: %s)", cfg.browser_profile)
-        context = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(cfg.browser_profile),
-            channel=cfg.browser_channel,
-            headless=False,
-            slow_mo=cfg.slow_mo_ms,
-            viewport={"width": 1400, "height": 900},
-            record_har_path=str(har_path),
-            record_har_content="embed",
-            # Requests made by a service worker would bypass our recorder and write guard.
-            service_workers="block",
-        )
-        await context.route("**/*", rec.route)
-        context.on("response", rec.on_response)
-        context.on("page", lambda p: p.on("websocket", rec.on_websocket))
-        for p in context.pages:
-            p.on("websocket", rec.on_websocket)
-
-        page = context.pages[0] if context.pages else await context.new_page()
-        await page.goto("https://open.spotify.com/", wait_until="domcontentloaded")
-        await wait_for_login(context)
+        if cfg.is_desktop:
+            context, page, finish = await open_desktop_session(pw, cfg, rec, args)
+        else:
+            context, page, finish = await open_web_session(pw, cfg, rec, run_dir)
 
         log.info("Opening playlist %s", cfg.playlist_url)
-        await page.goto(cfg.playlist_url, wait_until="domcontentloaded")
+        await goto_playlist(cfg, page)
         await page.wait_for_timeout(4000)  # let the playlist and its lazy requests load
         first = await snapshot_dom(page, run_dir, "playlist_loaded", patterns)
         candidates = first["candidates"] if first else []
         _print_candidates(candidates)
 
-        print("\n=== Now open the mix / transitions editor ===\n"
-              "In the browser: open the playlist's mix/transition view if the web player has one\n"
-              "(or try 'c' / 'o N' below). Click each transition so its details load, and take a\n"
-              "snapshot ('s') while each one is shown. Scroll through the whole playlist too.\n"
+        where = "the Spotify window" if cfg.is_desktop else "the browser"
+        print(f"\n=== Now open the mix / transitions editor ===\n"
+              f"In {where}: open the playlist's mix/transition view (or try 'c' / 'o N' below).\n"
+              "Click each transition so its details load, and take a snapshot ('s') while each\n"
+              "one is shown. Scroll through the whole playlist too.\n"
               "Go slowly; do not press Save/Apply.")
         print(COMMANDS_HELP)
         snap_n = 0
+
+        if args.auto:
+            captured = await auto_walk(page, run_dir, patterns, args.preview_ms)
+            if captured:
+                log.info("Auto-walk captured %d transition(s). Nothing else to do by hand.",
+                         captured)
+            else:
+                log.warning("Auto-walk captured nothing. Open the mix editor on the playlist, "
+                            "then use 'a' to retry or 's' to snapshot by hand.")
+
         while True:
             cmd = (await ainput("discover> ")).strip()
             if cmd in ("q", "quit", "exit"):
                 break
-            if cmd in ("s", ""):
+            if cmd == "a":
+                await auto_walk(page, run_dir, patterns, args.preview_ms)
+            elif cmd in ("s", ""):
                 snap_n += 1
                 await snapshot_dom(page, run_dir, f"snapshot_{snap_n:02d}", patterns)
             elif cmd == "c":
@@ -341,7 +445,7 @@ async def run(cfg, run_dir: Path) -> int:
             elif cmd.startswith("o "):
                 await _click_candidate(page, candidates, cmd[2:].strip())
             elif cmd == "p":
-                await page.goto(cfg.playlist_url, wait_until="domcontentloaded")
+                await goto_playlist(cfg, page)
             else:
                 print(COMMANDS_HELP)
 
@@ -349,8 +453,7 @@ async def run(cfg, run_dir: Path) -> int:
         log.info("Waiting for pending response bodies...")
         await page.wait_for_timeout(1500)
         await rec.drain()
-        log.info("Closing browser and writing HAR (this can take a moment)...")
-        await context.close()
+        await finish()
 
     rec.close()
     log.info("Capture complete: %d responses indexed, %d bodies saved, %d write requests blocked.",
@@ -358,6 +461,131 @@ async def run(cfg, run_dir: Path) -> int:
     log.info("Run folder: %s", run_dir)
     log.info("Next: python phase1_analyze.py %s", run_dir)
     return 0
+
+
+# --------------------------------------------------------------------------
+# Walking every transition without a human at the keyboard
+# --------------------------------------------------------------------------
+# The mix view puts a strip above each track for the transition leading into
+# it. Each strip holds two controls:
+#
+#   * a chip naming the transition ("Custom" / "Automatic"). Clicking the chip
+#     is what opens that transition in the curve editor, and its aria-checked
+#     says whether its editor is the one currently open. That attribute is the
+#     readiness signal this walk waits on - without it the editor still shows
+#     the previous transition and the snapshot captures the wrong one.
+#   * a preview button. Playing a transition is the only way to make the
+#     player report its volume/EQ curves, so previewing is how the automation
+#     gets captured.
+#
+# Everything here is keyed on role/aria/data-encore-id attributes rather than
+# the hashed class names beside them, which change with every Spotify build.
+# aria-pressed is what separates a transition strip's chip from the chips
+# inside the editor itself (the overlap-length chip reads "2 bars" and has an
+# aria-label instead). Without it the walk also tries to click that one.
+TRANSITION_CHIP = ('button[data-encore-id="chip"][role="checkbox"][aria-pressed]')
+#: The panel that only exists while a transition is open in the editor.
+INGREDIENT_PANEL = "[data-curve-editing-ingredient-controls]"
+#: Labels of the per-strip preview button, by UI language.
+PREVIEW_LABELS = ("play transition", "play the transition", "ניגון המעבר")
+
+
+async def _chip_is_open(chip) -> bool:
+    try:
+        return (await chip.get_attribute("aria-checked")) == "true"
+    except Exception:
+        return False
+
+
+async def _wait_until_open(page, chip, timeout_ms: int = 8000) -> bool:
+    """Wait for this chip's editor to be the open one."""
+    waited, step = 0, 200
+    while waited < timeout_ms:
+        if await _chip_is_open(chip):
+            return True
+        await page.wait_for_timeout(step)
+        waited += step
+    return False
+
+
+async def auto_walk(page, run_dir: Path, patterns: dict, preview_ms: int) -> int:
+    """Open each transition in turn, preview it, and snapshot it.
+
+    Returns how many transitions were captured. This only ever clicks a
+    transition's own chip and its own preview button; it never touches Save,
+    and the write guard stays in force underneath.
+    """
+    chips = page.locator(TRANSITION_CHIP)
+    try:
+        count = await chips.count()
+    except Exception as e:
+        log.error("Could not look for transition chips (%s).", e)
+        return 0
+    if not count:
+        log.error("Found no transition chips (%s). Open the playlist's Mix view first - the "
+                  "chips are the 'Custom'/'Automatic' labels between tracks. Then use 'a' to "
+                  "retry, or 's' to snapshot by hand.", TRANSITION_CHIP)
+        return 0
+
+    log.info("Found %d transition chip(s). Walking them automatically.", count)
+    captured = 0
+    for i in range(count):
+        chip = chips.nth(i)
+        try:
+            await chip.scroll_into_view_if_needed(timeout=5000)
+        except Exception as e:
+            log.warning("Transition %d/%d: could not scroll to it (%s); skipping.",
+                        i + 1, count, e)
+            continue
+
+        if not await _chip_is_open(chip):
+            try:
+                await chip.click(timeout=5000)
+            except Exception as e:
+                log.warning("Transition %d/%d: could not open it (%s); skipping.",
+                            i + 1, count, e)
+                continue
+
+        # Do not snapshot until this transition's editor is the open one -
+        # otherwise the panel is still showing the previous transition.
+        if not await _wait_until_open(page, chip):
+            log.warning("Transition %d/%d: editor did not report itself open; skipping so a "
+                        "stale panel is not recorded as this transition.", i + 1, count)
+            continue
+        try:
+            await page.locator(INGREDIENT_PANEL).first.wait_for(state="visible", timeout=8000)
+        except Exception:
+            log.warning("Transition %d/%d: no ingredient panel appeared; skipping.",
+                        i + 1, count)
+            continue
+        await page.wait_for_timeout(700)      # let the curves and sliders settle
+
+        if preview_ms > 0:
+            await _preview_transition(page, chip, preview_ms)
+
+        if await snapshot_dom(page, run_dir, f"auto_{i + 1:02d}", patterns):
+            captured += 1
+            log.info("  [%d/%d] captured", i + 1, count)
+
+    log.info("Auto-walk finished: %d/%d transition(s) captured.", captured, count)
+    return captured
+
+
+async def _preview_transition(page, chip, preview_ms: int) -> None:
+    """Play the transition this chip belongs to, so its curves are reported."""
+    # The preview button is a sibling of the chip inside the same strip.
+    strip = chip.locator("xpath=ancestor::*[.//button[@aria-label]][1]")
+    for text in PREVIEW_LABELS:
+        for scope in (strip, page):
+            button = scope.locator(f'button[aria-label="{text}"]')
+            try:
+                if await button.count():
+                    await button.first.click(timeout=4000)
+                    await page.wait_for_timeout(preview_ms)
+                    return
+            except Exception as e:
+                log.debug("Preview click failed for %r: %s", text, e)
+    log.debug("No preview button found for this transition; its curves stay uncaptured.")
 
 
 def _print_candidates(candidates: list[dict]) -> None:
@@ -393,6 +621,29 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("-v", "--verbose", action="store_true", help="log every captured response")
+    ap.add_argument("--target", choices=sorted(TARGETS),
+                    help="override browser.target: 'desktop' drives the Spotify app, "
+                         "'web' the web player")
+    ap.add_argument("--cdp-port", type=int, metavar="PORT",
+                    help="desktop: DevTools port to start Spotify on (default from config, 9222)")
+    ap.add_argument("--spotify-exe", metavar="PATH",
+                    help="desktop: path to Spotify.exe, if it is not where we look")
+    ap.add_argument("--attach", action="store_true",
+                    help="desktop: attach to a Spotify you already started with "
+                         "--remote-debugging-port, instead of launching one")
+    ap.add_argument("--close-spotify", action="store_true",
+                    help="desktop: close a running Spotify so it can be restarted with debugging "
+                         "enabled. This stops playback.")
+    ap.add_argument("--auto", action="store_true",
+                    help="walk every transition in the mix editor automatically: open each one, "
+                         "preview it so the player reports its fade curves, and snapshot it. "
+                         "No keyboard needed. Open the mix editor first, then run this.")
+    ap.add_argument("--preview-ms", type=int, default=4000, metavar="MS",
+                    help="with --auto, how long to let each transition play so its curves are "
+                         "captured (default 4000). 0 previews nothing and only reads the DOM.")
+    ap.add_argument("--no-reload", action="store_true",
+                    help="desktop: don't reload the UI on attach. Keeps what is on screen, but "
+                         "misses the app's startup requests and the dealer WebSocket.")
     args = ap.parse_args()
 
     try:
@@ -401,14 +652,28 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    if args.target:
+        cfg.browser_target = args.target
+    if args.cdp_port:
+        cfg.cdp_port = args.cdp_port
+    if args.spotify_exe:
+        cfg.spotify_exe = args.spotify_exe
+    if not cfg.is_desktop and (args.attach or args.close_spotify or args.no_reload):
+        print("ERROR: --attach / --close-spotify / --no-reload only apply to --target desktop",
+              file=sys.stderr)
+        return 2
+
     run_dir = cfg.output_dir / "discovery" / datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(run_dir / "discover.log", verbose=args.verbose)
-    log.info("Phase 1 discovery - playlist %s", cfg.playlist_id)
-    log.warning("The run folder will contain session tokens (HAR). Do not share or commit it; "
+    log.info("Phase 1 discovery - target %s, playlist %s", cfg.browser_target, cfg.playlist_id)
+    log.warning("The run folder will contain session tokens. Do not share or commit it; "
                 "share only the report from phase1_analyze.py.")
     try:
-        return asyncio.run(run(cfg, run_dir))
+        return asyncio.run(run(cfg, run_dir, args))
+    except desktop.DesktopError as e:
+        log.error("%s", e)
+        return 2
     except KeyboardInterrupt:
         log.warning("Interrupted. Partial capture left in %s (HAR may be incomplete).", run_dir)
         return 130

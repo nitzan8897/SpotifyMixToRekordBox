@@ -23,14 +23,14 @@ from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
-from spotimix.config import ConfigError, load_config
-from spotimix.logs import setup_logging
-from spotimix.scan import (
-    Hit, compile_keywords, generalize_path, get_at, match_text, parent_path,
-    printable_strings, redact, scan_json, tokenize, walk,
+from src.config import ConfigError, load_config
+from src.logs import setup_logging
+from src.scan import (
+                      Hit, compile_keywords, generalize_path, get_at, match_text, parent_path,
+                      printable_strings, redact, scan_json, tokenize, walk,
 )
 
-log = logging.getLogger("spotimix.analyze")
+log = logging.getLogger("src.analyze")
 
 # Tokens that make a hit clearly about mixing rather than e.g. "volume" or "low".
 STRONG_TOKENS = {"transition", "transitions", "crossfade", "crossfades", "mix", "mixed", "mixes",
