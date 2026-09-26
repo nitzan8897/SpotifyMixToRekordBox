@@ -1,0 +1,7 @@
+# Browser profile holds your Spotify session cookies - never commit it.
+.browser-profile/
+# Discovery captures (HAR, response bodies) contain auth tokens - never commit them.
+output/
+__pycache__/
+*.pyc
+.venv/

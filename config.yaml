@@ -1,0 +1,70 @@
+# Spotify mix -> rekordbox configuration.
+# Paths are relative to this file unless absolute.
+
+# The Spotify playlist that holds your mixed transitions (must be one you own).
+playlist_url: "https://open.spotify.com/playlist/REPLACE_WITH_YOUR_PLAYLIST_ID"
+
+paths:
+  # Persistent browser profile. Your Spotify login lives here (cookies only;
+  # this tool never sees or stores your password). Keep it private.
+  browser_profile: ".browser-profile"
+  # All captures, reports and generated files go here.
+  output_dir: "output"
+
+browser:
+  # null = Playwright's bundled Chromium. "chrome" or "msedge" = your installed
+  # browser, which is closer to what Spotify expects (e.g. DRM for playback).
+  channel: null
+  # Slows every Playwright action down (ms). Keeps us gentle on Spotify.
+  slow_mo_ms: 250
+
+discovery:
+  # Abort requests that would modify playlists or your library while we
+  # record (see spotimix/guard.py). Leave this on.
+  block_playlist_writes: true
+  # Only responses from these hosts (and subdomains) have bodies saved.
+  capture_hosts:
+    - spotify.com
+    - spotify.net
+    - spotifycdn.com
+    - scdn.co
+  # Response bodies larger than this are skipped (still listed in the index).
+  max_body_bytes: 5000000
+  # Words searched for in JSON keys/values, WebSocket frames and the DOM.
+  # Multi-word entries (start_ms) match consecutive tokens of a key, so
+  # startMs, start_ms and START-MS all match.
+  keywords:
+    - transition
+    - crossfade
+    - fade
+    - fade_in
+    - fade_out
+    - mix
+    - mixed
+    - automix
+    - blend
+    - segue
+    - cue
+    - offset
+    - start_ms
+    - end_ms
+    - start_time
+    - end_time
+    - in_point
+    - out_point
+    - duration_ms
+    - overlap
+    - curve
+    - eq
+    - equalizer
+    - low
+    - mid
+    - high
+    - filter
+    - effect
+    - fx
+    - gain
+    - volume
+    - bpm
+    - tempo
+    - beat
