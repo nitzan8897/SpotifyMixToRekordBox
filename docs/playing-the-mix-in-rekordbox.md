@@ -15,6 +15,10 @@ makes rekordbox mix on top of your mix and ruin both.
 Menu paths below are rekordbox 6 and 7. Labels move between versions, so treat
 them as where to look rather than exact clicks.
 
+If you do not want to perform the blends at all, you are reading the wrong
+guide: [rendering the mix](rendering-the-mix.md) produces a finished set that
+just plays, and you can still run a controller over the top of it.
+
 ## Set expectations first
 
 The import gives you the running order, a cue at every mix point, loops where

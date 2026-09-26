@@ -8,8 +8,20 @@ logged-in session while it clicks through the playlist for you. The mix editor
 only exists in the **desktop app**, so it drives that over the Chrome DevTools
 Protocol, the client being Chromium underneath.
 
+There are two ways to end up with the mix, and they answer different needs.
+
+**Render it to one audio file** (Phase 4) if you want the set to simply play.
+The blends are done for you: volume, EQ and filter moves applied exactly where
+Spotify had them, written out as a single continuous track. Plays anywhere,
+needs no controller and no timing skill.
+
+**Export cue points** (Phase 3) if you want to DJ it yourself. rekordbox gets
+the running order and a cue at every mix point, and you perform the blends.
+
 ## Documentation
 
+- **[Rendering the mix](docs/rendering-the-mix.md)** - producing a finished
+  set you can just play, and running a controller over it.
 - **[Transferring a Spotify mix](docs/transferring-a-spotify-mix.md)** - the
   full pipeline, what survives the trip, and what to check at each step.
 - **[Playing the mix in rekordbox](docs/playing-the-mix-in-rekordbox.md)** -
@@ -26,12 +38,18 @@ pip install -r requirements.txt
 python phase1_discover.py --auto     # walks every transition by itself
 python phase2_extract.py             # -> transitions.json, cue_sheet.md
 python phase0_download.py            # fetch the audio, then audit it
-python phase3_rekordbox.py           # -> rekordbox.xml
+
+python phase4_render.py              # -> mix.mp3, the finished set
+#   or
+python phase3_rekordbox.py           # -> rekordbox.xml, cues to perform
 ```
 
-Then import `rekordbox.xml`, and **turn off rekordbox's Automix and Fade
-In/Out** or it will add its own transitions on top of the imported cues. That
-trap and the rest of playback are covered in the
+`mix.mp3` is ready to play. Load it into rekordbox as a single track if you
+want to run a controller over the top of it.
+
+If you take the cue-point route instead, **turn off rekordbox's Automix and
+Fade In/Out** or it will add its own transitions on top of the imported cues.
+That trap and the rest of playback are covered in the
 [rekordbox guide](docs/playing-the-mix-in-rekordbox.md).
 
 ## What transfers, and what does not
@@ -42,12 +60,15 @@ trap and the rest of playback are covered in the
 | BPM and key | Fully |
 | Which of the five effect slots you chose | As text, in the cue sheet |
 | Loop length in beats | As a real loop marker |
-| Volume and EQ automation curves | **No** |
+| Volume and EQ automation curves | Into the render, **not** into rekordbox |
 
-rekordbox XML has no field for mixer automation, so the curves cannot be
-imported by any tool. What you get is every cue in the right place and a
-written record of the blend to perform over it. There is no setting that makes
-rekordbox replay a Spotify mix unattended.
+rekordbox XML has no field for mixer automation, so no tool can import the
+curves and no setting makes rekordbox replay a Spotify mix unattended. That is
+why Phase 4 exists: it applies the automation here and hands you finished
+audio, which sidesteps the format's limits entirely.
+
+Not reproduced in the render: the Effects slot, meaning reverb and echo tails.
+Those transitions still blend correctly, just without the tail.
 
 ## Where the transition data actually lives
 
@@ -118,7 +139,8 @@ phase0_download.py     fetch the audio the mix needs, then audit it
 phase1_discover.py     drive Spotify and record the mix editor
 phase1_analyze.py      survey a raw capture for where the data lives
 phase2_extract.py      capture -> transitions.json + cue_sheet.md
-phase3_rekordbox.py    transitions.json -> rekordbox.xml
+phase3_rekordbox.py    transitions.json -> rekordbox.xml (cues to perform)
+phase4_render.py       transitions.json + audio -> mix.mp3 (finished set)
 
 src/
   config.py        config.yaml loading and validation
@@ -130,6 +152,7 @@ src/
   automix.py       decoding the volume and EQ curves
   align.py         matching a local file to Spotify's timeline
   rekordbox.py     the collection, the cues and the XML
+  render.py        mixing the set down to one continuous file
   logs.py          logging setup
 
 docs/              the two guides linked above
@@ -145,11 +168,13 @@ Python 3.11+, and `pip install -r requirements.txt`:
 | playwright | driving Spotify |
 | PyYAML | config |
 | mutagen | reading file durations |
-| soundfile, numpy | silence detection for cue alignment |
+| soundfile, numpy | silence detection for cue alignment, and audio for the render |
+| scipy | the three-band EQ split used when rendering |
 
-mutagen, soundfile and numpy degrade gracefully: without them the export still
-works, it just cannot catch a wrong-edit download or shift cues onto a file
-that starts with silence.
+mutagen, soundfile, numpy and scipy degrade gracefully for the cue-point
+export: without them it still works, it just cannot catch a wrong-edit
+download or shift cues onto a file that starts with silence. Rendering needs
+all of them.
 
 ## Tests
 

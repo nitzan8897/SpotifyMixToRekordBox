@@ -36,8 +36,9 @@ metadata. No exporter can put it there. What you get instead is every cue in
 the right place, the effect settings written down, and loops where Spotify had
 loops, so you can perform the blend yourself.
 
-If you want unattended playback that sounds like Spotify, this pipeline cannot
-give you that, and neither can anything else that writes rekordbox XML.
+If you want unattended playback that sounds like Spotify, no rekordbox XML can
+give you that. [Rendering the mix](rendering-the-mix.md) can: it applies the
+automation here and writes finished audio, sidestepping the format entirely.
 
 ## Before you start
 
@@ -56,13 +57,14 @@ One safety note: capture runs with a write guard on
 aborts any request that would modify a playlist or your library, so a capture
 cannot damage the mix it is reading. Leave it on.
 
-## The four phases
+## The phases
 
 ```text
 Phase 1  phase1_discover.py   drive Spotify, record the editor      -> output/discovery/<run>/
 Phase 2  phase2_extract.py    turn the capture into structured data -> transitions.json, cue_sheet.md
 Phase 0  phase0_download.py   fetch the audio (needs Phase 2 first) -> your music_dir
 Phase 3  phase3_rekordbox.py  build the importable playlist         -> rekordbox.xml
+Phase 4  phase4_render.py     mix it down to finished audio         -> mix.mp3
 ```
 
 Phase 0 is numbered before Phase 1 because the audio comes first conceptually,
