@@ -90,6 +90,33 @@ def tracks_in_mix(run_dir: Path) -> list[dict]:
     return out
 
 
+def last_used_ms(run_dir: Path) -> dict[str, int]:
+    """The latest moment the mix actually plays of each track, by title.
+
+    A track's cues sit where the blends are, which is usually nowhere near its
+    end. So a file that is short only *after* that point carries every cue
+    correctly, and calling it a different edit sends someone hunting for a
+    replacement that would change nothing.
+    """
+    try:
+        data = json.loads((run_dir / "transitions.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    latest: dict[str, int] = {}
+
+    def note(title, ms):
+        if title and ms is not None:
+            latest[title] = max(latest.get(title, 0), int(ms))
+
+    for t in data.get("transitions") or []:
+        overlap = t.get("overlap_ms") or 0
+        note((t.get("from_track") or {}).get("title"),
+             (t.get("out_point_ms") or 0) + overlap)
+        note((t.get("to_track") or {}).get("title"),
+             (t.get("in_point_ms") or 0) + overlap)
+    return latest
+
+
 def describe(track: dict) -> str:
     who = ", ".join(track.get("artists") or []) or "?"
     return f"{track.get('title') or '?'} - {who}"
@@ -387,14 +414,22 @@ def main() -> int:
 
     print("Checking each file against Spotify's duration...")
     rows = check_downloads(tracks, music_dir)
-    wrong, absent, unjudged, fine = [], [], [], 0
+    latest = last_used_ms(run_dir)
+    wrong, absent, unjudged, harmless, fine = [], [], [], [], 0
     for t, path, a in rows:
         if path is None or a is None or a.probe is None:
             absent.append(t)
         elif not a.judged:
             unjudged.append((t, a))
         elif not a.same_recording:
-            wrong.append((t, a))
+            # A file short only past the last moment the mix plays of it still
+            # carries every cue. Say so instead of demanding a replacement.
+            needed = latest.get(t.get("title"))
+            short = (a.delta_ms or 0) < 0
+            if short and needed and a.probe.duration_ms > needed:
+                harmless.append((t, a, a.probe.duration_ms - needed))
+            else:
+                wrong.append((t, a))
         else:
             fine += 1
 
@@ -403,6 +438,13 @@ def main() -> int:
         print(f"   {len(absent)} track(s) have no usable local file:")
         for t in absent:
             print(f"      {describe(t)}")
+    if harmless:
+        print(f"   {len(harmless)} file(s) are shorter than Spotify's, but only past the "
+              "point the mix uses:")
+        for t, a, spare in harmless:
+            print(f"      {a.delta_ms:+7d} ms   {describe(t)}")
+            print(f"         {spare} ms of it still unused after the last blend, "
+                  "so every cue lands correctly")
     if unjudged:
         print(f"   {len(unjudged)} file(s) could not be judged:")
         for t, a in unjudged:

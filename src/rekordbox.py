@@ -234,21 +234,51 @@ class Entry:
         """Shift applied to every cue so it lands on the same music locally."""
         return self.alignment.offset_ms if self.alignment else 0
 
+    @property
+    def last_used_ms(self) -> int:
+        """The latest moment the mix actually plays of this track."""
+        if not self.cues:
+            return 0
+        return int(round(1000 * max(max(c.seconds, c.loop_end or 0) for c in self.cues)))
+
+    def covers_its_cues(self) -> bool:
+        """True when the local file reaches past everything the mix uses of it."""
+        if self.alignment is None or self.alignment.probe is None:
+            return False
+        return self.alignment.probe.duration_ms > self.last_used_ms > 0
+
     def is_different_edit(self) -> bool:
         """True when the matched file is too far off to carry these cues.
 
-        The alignment verdict is preferred where there is one, because it
-        compares *content* length - the audio once the silence at each end is
-        discounted. Raw file length alone is misleading in both directions: a
-        download can be seconds longer purely because of an outro tail and
-        still be the same recording, and one that starts with silence is
-        handled by shifting rather than by rejecting it.
+        The alignment verdict leads, because it compares *content* length - the
+        audio once the silence at each end is discounted. Raw file length alone
+        misleads in both directions: a download can be seconds longer purely
+        because of an outro tail and still be the same recording, and one that
+        starts with silence is handled by shifting rather than rejecting.
+
+        One more allowance on top of that verdict. A track's cues sit where its
+        blends are, which is usually nowhere near its end, so a file that falls
+        short only *after* the last moment the mix plays of it still carries
+        every cue. Reporting that as a different edit sends someone hunting for
+        a replacement that would change nothing - and in one real case no
+        better upload existed anyway.
 
         Without an alignment (no decoder installed, or --no-align) this falls
-        back to raw length, which is the best available signal.
+        back to raw length, which is then the best available signal.
         """
         if self.alignment is not None and self.alignment.probe is not None:
-            return not self.alignment.same_recording
+            if not self.alignment.judged:
+                # No Spotify duration to compare against. Unknown is not an
+                # accusation: without a reference there is nothing to be wrong
+                # about, and saying otherwise sends someone replacing a file
+                # that may be perfectly correct.
+                return False
+            if self.alignment.same_recording:
+                return False
+            short = (self.alignment.delta_ms or 0) < 0
+            if short and self.covers_its_cues():
+                return False
+            return True
         return (self.duration_delta_ms is not None
                 and abs(self.duration_delta_ms) > DURATION_TOLERANCE_MS)
 

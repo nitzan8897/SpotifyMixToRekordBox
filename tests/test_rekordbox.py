@@ -202,3 +202,46 @@ class DifferentEditTest(unittest.TestCase):
 
     def test_unknown_length_is_not_an_accusation(self):
         self.assertFalse(self.entry().is_different_edit())
+
+
+class ShortTailTest(unittest.TestCase):
+    """A file short only past what the mix plays of it still carries its cues."""
+
+    def entry(self, file_ms, spotify_ms, cues, same=False, judged=True):
+        probe = align_mod.Probe(duration_ms=file_ms, lead_in_ms=0, tail_ms=0)
+        a = align_mod.Alignment(probe=probe, spotify_ms=spotify_ms if judged else None,
+                                same_recording=same)
+        return rb.Entry(track_id=1, title="T", artists=[], bpm=None, camelot=None,
+                        duration_ms=spotify_ms, spotify_id=None,
+                        local_path=Path("t.mp3"),
+                        duration_delta_ms=file_ms - spotify_ms, alignment=a,
+                        cues=cues)
+
+    def test_short_past_the_last_cue_is_not_a_problem(self):
+        """The real case: Automotivo is 1722 ms short of Spotify, and the mix
+        stops using it 29.6 s before the file ends."""
+        e = self.entry(166278, 168000, [rb.Cue("out", 131.692, loop_end=136.692)])
+        self.assertEqual(e.last_used_ms, 136692)
+        self.assertTrue(e.covers_its_cues())
+        self.assertFalse(e.is_different_edit())
+
+    def test_short_before_the_last_cue_is_a_problem(self):
+        e = self.entry(120000, 168000, [rb.Cue("out", 131.692)])
+        self.assertFalse(e.covers_its_cues())
+        self.assertTrue(e.is_different_edit())
+
+    def test_a_longer_file_is_still_judged_on_content(self):
+        """The allowance is for short files only; extra music is a real signal."""
+        e = self.entry(178000, 168000, [rb.Cue("out", 10.0)])
+        self.assertTrue(e.is_different_edit())
+
+    def test_no_spotify_duration_is_not_an_accusation(self):
+        """Pikezin do M.J has no duration in the capture. Without a reference
+        there is nothing to be wrong about."""
+        e = self.entry(156120, 0, [rb.Cue("out", 100.0)], judged=False)
+        self.assertFalse(e.is_different_edit())
+
+    def test_a_track_with_no_cues_cannot_be_cleared_this_way(self):
+        e = self.entry(120000, 168000, [])
+        self.assertEqual(e.last_used_ms, 0)
+        self.assertFalse(e.covers_its_cues())
