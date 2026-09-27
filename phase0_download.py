@@ -41,9 +41,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.align import CONTENT_TOLERANCE_MS
+from src.align import CONTENT_TOLERANCE_MS, align
 from src.config import ConfigError, load_config
-from src.rekordbox import DURATION_TOLERANCE_MS, fold, read_duration_ms
+from src.rekordbox import fold
 
 #: Audio format and bitrate to ask spotdl for.
 FORMAT = "mp3"
@@ -92,21 +92,110 @@ def describe(track: dict) -> str:
     return f"{track.get('title') or '?'} - {who}"
 
 
-def check_downloads(tracks: list[dict], music_dir: Path) -> list[tuple[dict, int | None, int | None]]:
-    """Compare what landed on disk against what Spotify says each track is.
+def check_downloads(tracks: list[dict], music_dir: Path) -> list[tuple[dict, Path | None, object]]:
+    """Judge each local file against what Spotify says the track is.
 
-    Returns one row per track: ``(track, file_ms, delta_ms)``. ``file_ms`` is
-    None when no file could be matched to it at all.
+    Returns ``(track, path, alignment)`` per track. The verdict comes from
+    :func:`src.align.align`, which compares *content* length - the audio once
+    silence at both ends is discounted - rather than raw file length. That
+    distinction matters: a download can be seconds longer than Spotify purely
+    because of an outro tail and still be the same recording, while one that
+    ends early cannot be.
     """
     from src.rekordbox import match_local_file, scan_music_dirs
 
     files = scan_music_dirs([music_dir])
     rows = []
     for t in tracks:
-        path, delta = match_local_file(t.get("title"), t.get("artists") or [],
-                                       files, t.get("duration_ms"))
-        rows.append((t, read_duration_ms(path) if path else None, delta))
+        path, _ = match_local_file(t.get("title"), t.get("artists") or [],
+                                   files, t.get("duration_ms"))
+        rows.append((t, path, align(path, t.get("duration_ms")) if path else None))
     return rows
+
+
+def find_source(track: dict, results: int = 12) -> tuple[str, int] | None:
+    """Search YouTube for the upload whose length best fits Spotify's.
+
+    This is the step spotdl does not do. It picks the first plausible search
+    result, which regularly lands on a sped-up edit, a TikTok cut or - as
+    happened here - a version overlaid with game audio. Choosing by duration
+    instead gets the right recording most of the time, because a different
+    arrangement is a different length.
+
+    Returns ``(youtube_url, duration_ms)`` or None.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        log_print("   yt-dlp is not installed, so no search is possible "
+                  "(pip install yt-dlp).")
+        return None
+
+    target = track.get("duration_ms")
+    if not target:
+        return None
+    who = " ".join(track.get("artists") or [])
+    query = f"ytsearch{results}:{track.get('title') or ''} {who}".strip()
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "extract_flat": "in_playlist"}
+    try:
+        with yt_dlp.YoutubeDL(opts) as y:
+            info = y.extract_info(query, download=False)
+    except Exception as e:
+        log_print(f"   search failed: {e}")
+        return None
+
+    best = None
+    for e in info.get("entries") or []:
+        secs = e.get("duration")
+        if not secs:
+            continue
+        ms = int(secs * 1000)
+        # Search durations come back rounded to the second, so this only has
+        # to get close; the download is measured properly afterwards.
+        gap = abs(ms - target)
+        if best is None or gap < best[0]:
+            best = (gap, f"https://www.youtube.com/watch?v={e.get('id')}", ms)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def log_print(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def refetch(track: dict, music_dir: Path) -> bool:
+    """Replace one track's audio with a duration-matched source.
+
+    The existing file is moved aside rather than deleted, and - importantly -
+    moved *outside* ``music_dir``, because the scanner recurses and would
+    otherwise match the discarded copy too.
+    """
+    sid = track.get("spotify_id")
+    if not sid:
+        log_print(f"   no Spotify id for {describe(track)}; cannot refetch")
+        return False
+    found = find_source(track)
+    if not found:
+        log_print(f"   no candidate found for {describe(track)}")
+        return False
+    url, ms = found
+    log_print(f"   source: {url}  ({ms} ms vs Spotify's {track.get('duration_ms')})")
+
+    from src.rekordbox import match_local_file, scan_music_dirs
+    existing, _ = match_local_file(track.get("title"), track.get("artists") or [],
+                                   scan_music_dirs([music_dir]), track.get("duration_ms"))
+    if existing:
+        attic = music_dir.parent / f"_{music_dir.name} replaced originals"
+        attic.mkdir(parents=True, exist_ok=True)
+        existing.replace(attic / existing.name)
+        log_print(f"   old file moved to {attic}")
+
+    cmd = [sys.executable, "-m", "spotdl", "download",
+           f"{url}|https://open.spotify.com/track/{sid}",
+           "--output", str(music_dir), "--format", FORMAT, "--bitrate", BITRATE]
+    return subprocess.run(cmd).returncode == 0
 
 
 def main() -> int:
@@ -119,6 +208,10 @@ def main() -> int:
     ap.add_argument("--only", action="append", default=[], metavar="TITLE",
                     help="download just the tracks whose title contains this; repeat to add "
                          "more. Use it to replace the handful that came back wrong.")
+    ap.add_argument("--fix", action="store_true",
+                    help="after checking, re-fetch every file that is a different edit, "
+                         "choosing the source whose length matches Spotify's. The replaced "
+                         "files are kept in a sibling folder, not deleted.")
     ap.add_argument("--check-only", action="store_true",
                     help="download nothing; just report which local files disagree with "
                          "Spotify's durations")
@@ -180,34 +273,41 @@ def main() -> int:
     print("Checking each file against Spotify's duration...")
     rows = check_downloads(tracks, music_dir)
     wrong, absent, fine = [], [], 0
-    for t, file_ms, delta in rows:
-        if file_ms is None:
+    for t, path, a in rows:
+        if path is None or a is None or a.probe is None:
             absent.append(t)
-        elif delta is not None and abs(delta) > DURATION_TOLERANCE_MS:
-            wrong.append((t, delta))
+        elif not a.same_recording:
+            wrong.append((t, a))
         else:
             fine += 1
 
-    print(f"   {fine} file(s) match Spotify's length")
+    print(f"   {fine} file(s) are the same recording Spotify streamed")
     if absent:
-        print(f"   {len(absent)} track(s) have no local file:")
+        print(f"   {len(absent)} track(s) have no usable local file:")
         for t in absent:
             print(f"      {describe(t)}")
     if wrong:
-        wrong.sort(key=lambda r: -abs(r[1]))
+        wrong.sort(key=lambda r: -abs(r[1].delta_ms or 0))
         print(f"   {len(wrong)} file(s) are a DIFFERENT EDIT of the right song:")
-        for t, delta in wrong:
-            print(f"      {delta:+7d} ms   {describe(t)}")
+        for t, a in wrong:
+            print(f"      {a.delta_ms:+7d} ms   {describe(t)}")
+            print(f"                   {a.reason}")
         print()
         print("   Every cue is an absolute offset into Spotify's timeline, so on these")
-        print("   files the cues land on the wrong music. Re-fetch them with the audio")
-        print("   source pinned, one at a time:")
-        for t, _ in wrong[:3]:
-            sid = t.get("spotify_id") or "<id>"
-            print(f'      python -m spotdl download "<youtube url>|'
-                  f'https://open.spotify.com/track/{sid}"')
-        print(f"   (a difference under {CONTENT_TOLERANCE_MS} ms is usually just encoder "
-              "padding and is fine)")
+        print("   files the blends land on the wrong part of the music.")
+        if args.fix:
+            print()
+            print(f"Refetching {len(wrong)} track(s) with a duration-matched source...")
+            for t, _ in wrong:
+                print(f"   {describe(t)}")
+                refetch(t, music_dir)
+            print()
+            print("Done. Re-check with: python phase0_download.py --check-only")
+            print("Then re-render:      python phase4_render.py")
+        else:
+            print("   Fix them automatically with: python phase0_download.py --fix")
+            print(f"   (a content difference under {CONTENT_TOLERANCE_MS} ms is just "
+                  "padding and is fine)")
 
     return 1 if (wrong or absent) else 0
 

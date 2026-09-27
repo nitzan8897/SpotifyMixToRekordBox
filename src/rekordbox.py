@@ -235,7 +235,20 @@ class Entry:
         return self.alignment.offset_ms if self.alignment else 0
 
     def is_different_edit(self) -> bool:
-        """True when the matched file is too far off to carry these cues."""
+        """True when the matched file is too far off to carry these cues.
+
+        The alignment verdict is preferred where there is one, because it
+        compares *content* length - the audio once the silence at each end is
+        discounted. Raw file length alone is misleading in both directions: a
+        download can be seconds longer purely because of an outro tail and
+        still be the same recording, and one that starts with silence is
+        handled by shifting rather than by rejecting it.
+
+        Without an alignment (no decoder installed, or --no-align) this falls
+        back to raw length, which is the best available signal.
+        """
+        if self.alignment is not None and self.alignment.probe is not None:
+            return not self.alignment.same_recording
         return (self.duration_delta_ms is not None
                 and abs(self.duration_delta_ms) > DURATION_TOLERANCE_MS)
 

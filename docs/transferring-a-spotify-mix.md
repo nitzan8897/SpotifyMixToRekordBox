@@ -140,6 +140,7 @@ Takes the track list from `transitions.json`, downloads with spotdl into
 | Flag | Effect |
 | --- | --- |
 | `--check-only` | Download nothing, just audit what you already have |
+| `--fix` | Re-fetch every file that is a different edit, choosing the source whose length matches Spotify's |
 | `--only TITLE` | Download just matching tracks; repeat for several |
 
 Read [the section below](#the-one-problem-that-ruins-everything) before
@@ -246,19 +247,29 @@ extended mix, a re-upload with a long intro. The filename and tags look
 perfect. The music is arranged differently, so every cue on that file points
 at the wrong bar.
 
-Phase 0 and Phase 3 both compare each file's length against Spotify's and name
-the offenders. To force the audio for a specific track, hand spotdl both halves:
+Every phase that touches audio compares it against Spotify's duration and names
+the offenders. The comparison is on *content* length - the audio once silence at
+each end is discounted - because raw file length misleads in both directions. A
+download can be seconds longer purely because of an outro tail and still be the
+same recording; one that ends early cannot be.
+
+To fix them:
+
+```bash
+python phase0_download.py --fix
+```
+
+This searches for the upload whose length best matches Spotify's, instead of
+taking whatever the search returns first, which is how the wrong versions get
+in. Replaced files are moved to a sibling folder rather than deleted. To pin a
+specific source by hand:
 
 ```bash
 python -m spotdl download "https://youtu.be/<video id>|https://open.spotify.com/track/<track id>"
 ```
 
 The left side fixes which recording is fetched, the right side still supplies
-the tags. Check afterwards with `python phase0_download.py --check-only`.
-
-A difference under about 1.5 seconds is usually encoder padding and is fine.
-Several seconds means a different edit, and no amount of care elsewhere in the
-pipeline can recover it.
+the tags.
 
 ## Troubleshooting
 

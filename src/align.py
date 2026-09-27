@@ -124,16 +124,25 @@ def align(path: Path, spotify_ms: int | None) -> Alignment:
     a = Alignment(probe=p, spotify_ms=spotify_ms)
     content_gap = p.content_ms - spotify_ms
 
-    # Spotify's own duration includes whatever silence its master carries, so
-    # content shorter than the stated duration is normal and means nothing.
-    # Only content that *overruns* Spotify's whole duration proves a different
-    # edit: there is more music here than Spotify has room for.
+    delta = p.duration_ms - spotify_ms
+
+    # Two ways to prove a different edit, and both are needed.
+    #
+    # Too much music: the content overruns Spotify's whole duration, so there
+    # is more here than Spotify has room for.
     if content_gap > CONTENT_TOLERANCE_MS:
         a.reason = (f"local audio holds {content_gap} ms more music than Spotify's whole "
                     "duration, so this is a different edit")
         return a
-
-    delta = p.duration_ms - spotify_ms
+    # Too little: the file is simply shorter than Spotify says the track is.
+    # Content being *slightly* short is normal, since Spotify's duration
+    # includes whatever padding its own master carries - but a file that ends
+    # seconds early is a different cut, not a different encode. Missing this
+    # was how a 9-second-short game edit passed as the same recording.
+    if delta < -CONTENT_TOLERANCE_MS:
+        a.reason = (f"local audio is {-delta} ms shorter than Spotify's duration, so this is "
+                    "a different edit")
+        return a
     a.same_recording = True
 
     if delta <= MIN_SHIFT_MS:

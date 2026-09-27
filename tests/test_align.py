@@ -55,3 +55,39 @@ class AlignTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShortEditTest(unittest.TestCase):
+    """A file that ends seconds early is a different cut, not a different encode.
+
+    Taken from the real case: "Ela ke Leitada" came back as a game edit 9.2
+    seconds shorter than Spotify's, and the original rule - which only looked
+    for content *overrunning* Spotify's duration - called it the same
+    recording.
+    """
+    def _align(self, probe_result, spotify_ms):
+        real = align_mod.probe
+        align_mod.probe = lambda *a, **k: probe_result
+        try:
+            return align_mod.align(Path("x.mp3"), spotify_ms)
+        finally:
+            align_mod.probe = real
+
+    def test_a_file_that_ends_early_is_a_different_edit(self):
+        short = align_mod.Probe(duration_ms=147477, lead_in_ms=500, tail_ms=20)
+        a = self._align(short, 156708)
+        self.assertFalse(a.same_recording)
+        self.assertEqual(a.offset_ms, 0)
+        self.assertIn("shorter", a.reason)
+
+    def test_the_replacement_reads_as_the_same_recording(self):
+        """Same master with a 3.2 s outro tail: longer, but lines up from 0:00."""
+        good = align_mod.Probe(duration_ms=159451, lead_in_ms=100, tail_ms=3220)
+        a = self._align(good, 156708)
+        self.assertTrue(a.same_recording)
+        self.assertEqual(a.offset_ms, 0)          # nothing extra at the front
+
+    def test_slightly_short_is_still_the_same_recording(self):
+        """Spotify's duration includes its own padding, so a little short is fine."""
+        a = self._align(align_mod.Probe(duration_ms=156300, lead_in_ms=0, tail_ms=400), 156708)
+        self.assertTrue(a.same_recording)

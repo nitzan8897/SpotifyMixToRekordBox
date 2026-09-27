@@ -175,3 +175,30 @@ class RekordboxTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DifferentEditTest(unittest.TestCase):
+    """Judging a local file, preferring the content check over raw length."""
+
+    def entry(self, delta=None, alignment=None):
+        return rb.Entry(track_id=1, title="T", artists=[], bpm=None, camelot=None,
+                        duration_ms=156708, spotify_id=None, local_path=Path("t.mp3"),
+                        duration_delta_ms=delta, alignment=alignment)
+
+    def test_a_long_outro_is_not_a_different_edit(self):
+        """+2.7 s of tail silence is the same recording, and was being rejected."""
+        probe = align_mod.Probe(duration_ms=159451, lead_in_ms=100, tail_ms=3220)
+        a = align_mod.Alignment(probe=probe, spotify_ms=156708, same_recording=True)
+        self.assertFalse(self.entry(delta=2743, alignment=a).is_different_edit())
+
+    def test_a_short_cut_is_a_different_edit(self):
+        probe = align_mod.Probe(duration_ms=147477, lead_in_ms=500, tail_ms=20)
+        a = align_mod.Alignment(probe=probe, spotify_ms=156708, same_recording=False)
+        self.assertTrue(self.entry(delta=-9231, alignment=a).is_different_edit())
+
+    def test_falls_back_to_raw_length_without_an_alignment(self):
+        self.assertTrue(self.entry(delta=-9231).is_different_edit())
+        self.assertFalse(self.entry(delta=-400).is_different_edit())
+
+    def test_unknown_length_is_not_an_accusation(self):
+        self.assertFalse(self.entry().is_different_edit())
