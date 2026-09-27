@@ -46,7 +46,7 @@ from pathlib import Path
 
 from src.align import CONTENT_TOLERANCE_MS, align
 from src.config import ConfigError, load_config
-from src.rekordbox import fold
+from src.rekordbox import AUDIO_SUFFIXES, fold
 
 #: Audio format and bitrate to ask spotdl for.
 FORMAT = "mp3"
@@ -320,9 +320,9 @@ def main() -> int:
                     help="download just the tracks whose title contains this; repeat to add "
                          "more. Use it to replace the handful that came back wrong.")
     ap.add_argument("--fix", action="store_true",
-                    help="after checking, re-fetch every file that is a different edit, "
-                         "choosing the source whose length matches Spotify's. The replaced "
-                         "files are kept in a sibling folder, not deleted.")
+                    help="re-fetch only the files that are a different edit, choosing the "
+                         "source whose name and length match Spotify's. Downloads nothing "
+                         "else, and keeps each replaced file in a sibling folder.")
     ap.add_argument("--check-only", action="store_true",
                     help="download nothing; just report which local files disagree with "
                          "Spotify's durations")
@@ -357,7 +357,11 @@ def main() -> int:
     print(f"Music dir: {music_dir}")
     print("=" * 70)
 
-    if not args.check_only:
+    # --fix is a repair, not a fresh download: it must not touch the files
+    # that are already the right recording. Re-downloading everything risked
+    # replacing a verified file with whatever the search returns first, which
+    # is the very problem --fix exists to undo.
+    if not args.check_only and not args.fix:
         urls = [f"https://open.spotify.com/track/{t['spotify_id']}"
                 for t in tracks if t.get("spotify_id")]
         missing = [describe(t) for t in tracks if not t.get("spotify_id")]

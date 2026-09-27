@@ -145,3 +145,32 @@ class SourceChoiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModuleNamesTest(unittest.TestCase):
+    """Names the download path reaches for at run time.
+
+    A missing import here does not fail at import time - it fails deep inside
+    a refetch, after the download has already succeeded, which is how
+    AUDIO_SUFFIXES went unnoticed until a real repair crashed on it.
+    """
+    REQUIRED = ("AUDIO_SUFFIXES", "CONTENT_TOLERANCE_MS", "align", "fold",
+                "shutil", "tempfile", "subprocess", "SequenceMatcher",
+                "FORMAT", "BITRATE", "LENGTH_REJECT_MS", "SEARCH_RESULTS",
+                "REWORK")
+
+    def test_every_name_the_functions_use_is_present(self):
+        for name in self.REQUIRED:
+            self.assertTrue(hasattr(p0, name), f"phase0_download is missing {name}")
+
+    def test_audio_suffixes_is_the_shared_set(self):
+        from src.rekordbox import AUDIO_SUFFIXES
+        self.assertIs(p0.AUDIO_SUFFIXES, AUDIO_SUFFIXES)
+        self.assertIn(".mp3", p0.AUDIO_SUFFIXES)
+
+    def test_fix_does_not_bulk_download(self):
+        """--fix is a repair; re-downloading the good files risked undoing
+        earlier verified replacements."""
+        import inspect
+        src = inspect.getsource(p0.main)
+        self.assertIn("not args.check_only and not args.fix", src)
