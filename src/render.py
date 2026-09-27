@@ -187,38 +187,60 @@ def volume_envelopes(np, n: int, style: str | None):
     return np.cos(t * np.pi / 2).astype(np.float32), np.sin(t * np.pi / 2).astype(np.float32)
 
 
+#: Where each named bass swap hands the low end over, as a fraction of the
+#: overlap. These sit *inside* the overlap deliberately. Putting "start" at 0.0
+#: and "end" at 1.0 looks natural and is useless: the swap then falls on the
+#: boundary and never happens during the blend, which left the incoming track
+#: with no bass for the whole overlap - the Tuf Tuf into YUMMI transition, 7.4
+#: seconds of it, was audibly hollow because of exactly that.
+SWAP_AT = {"start bass swap": 0.25, "centre bass swap": 0.5, "end bass swap": 0.75}
+
+#: The cut Spotify applies to the non-bass bands during a 3-band fade: knob
+#: 0.2, measured off the one transition where the player reported its curves.
+BAND_CUT = 0.2
+
+
 def eq_envelopes(np, n: int, style: str | None):
     """(outgoing, incoming) band gains across the overlap, by EQ setting.
 
-    Each is a dict of band -> array of amplitude multipliers.
+    Grounded in the one transition whose real curves the capture caught. Two
+    things that measurement settled, both counter to how the names read:
+
+    * Spotify's "3-band fade" is not a fade. All three bands *step* at the
+      midpoint - low from unity to kill on the way out and kill to unity on
+      the way in, mid and high between unity and a 0.2 cut. So it is a
+      three-band swap, and it is rendered as one.
+    * The 0.2 cut belongs to that style. A bass swap only moves the low band;
+      leaving the incoming mids and highs cut through the whole overlap made
+      the new track sound distant for seconds at a time.
     """
     unity = np.ones(n, dtype=np.float32)
     kill = np.zeros(n, dtype=np.float32)
-    # The cut Spotify uses on the non-bass bands of the incoming track: knob
-    # 0.2, which on the scale above is 0.4 of unity amplitude.
-    cut = np.full(n, knob_to_gain(0.2), dtype=np.float32)
+    cut = np.full(n, knob_to_gain(BAND_CUT), dtype=np.float32)
 
-    swap_at = {"start bass swap": 0.0, "centre bass swap": 0.5, "end bass swap": 1.0}
-    if style in swap_at:
-        at = swap_at[style]
-        out_low = _step(np, n, 1.0, 0.0, at) if at > 0 else kill.copy()
-        in_low = _step(np, n, 0.0, 1.0, at) if at > 0 else unity.copy()
-        if at >= 1.0:
-            out_low, in_low = unity.copy(), kill.copy()
+    if style in SWAP_AT:
+        at = SWAP_AT[style]
+        # Only the low end changes hands. Everything else stays where it is,
+        # which is what makes this a bass swap rather than a full handover.
         return (
-            Move(None, out_low, unity.copy(), unity.copy()),
-            Move(None, in_low, cut.copy(), cut.copy()),
+            Move(None, _step(np, n, 1.0, 0.0, at), unity.copy(), unity.copy()),
+            Move(None, _step(np, n, 0.0, 1.0, at), unity.copy(), unity.copy()),
         )
     if style == "bass fade out":
+        # The one style that really is a ramp: the outgoing bass rides down.
         return (
             Move(None, _ramp(np, n, 1.0, 0.0), unity.copy(), unity.copy()),
             Move(None, unity.copy(), unity.copy(), unity.copy()),
         )
     if style == "3 band fade":
-        down, up = _ramp(np, n, 1.0, 0.0), _ramp(np, n, 0.0, 1.0)
+        half = 0.5
         return (
-            Move(None, down, down.copy(), down.copy()),
-            Move(None, up, up.copy(), up.copy()),
+            Move(None, _step(np, n, 1.0, 0.0, half),
+                 _step(np, n, 1.0, knob_to_gain(BAND_CUT), half),
+                 _step(np, n, 1.0, knob_to_gain(BAND_CUT), half)),
+            Move(None, _step(np, n, 0.0, 1.0, half),
+                 _step(np, n, knob_to_gain(BAND_CUT), 1.0, half),
+                 _step(np, n, knob_to_gain(BAND_CUT), 1.0, half)),
         )
     return (Move(None, unity.copy(), unity.copy(), unity.copy()),
             Move(None, unity.copy(), unity.copy(), unity.copy()))
@@ -418,8 +440,10 @@ def render(transitions: list, entry_for, rate: int = TARGET_RATE,
     if report.missing:
         raise RenderError("No local file for: " + ", ".join(report.missing))
 
-    total = int(report.duration_ms / 1000 * rate) + rate
-    mix = np.zeros((total, 2), dtype=np.float32)
+    # A second of slack so a segment that runs a touch long is not clipped by
+    # the buffer; the mix is trimmed back to its real length before returning.
+    length = int(report.duration_ms / 1000 * rate)
+    mix = np.zeros((length + rate, 2), dtype=np.float32)
 
     def ms(v):
         return int(round(v / 1000 * rate))
@@ -465,6 +489,7 @@ def render(transitions: list, entry_for, rate: int = TARGET_RATE,
 
         _add(mix, body, ms(seg.at_ms))
 
+    mix = mix[:length]                      # drop the slack, not real audio
     report.peak = float(np.abs(mix).max()) if len(mix) else 0.0
     return mix, report
 
@@ -492,3 +517,153 @@ def write(mix, path: Path, rate: int = TARGET_RATE) -> None:
     import soundfile as sf
     path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(path), mix, rate)
+
+
+# --------------------------------------------------------------------------
+# Splitting the mix into one file per song
+# --------------------------------------------------------------------------
+@dataclass
+class Piece:
+    """One output file: a song, with the blends already at its edges."""
+    index: int
+    title: str
+    #: where this piece begins and ends in the rendered mix (ms)
+    from_ms: int
+    to_ms: int
+
+    @property
+    def duration_ms(self) -> int:
+        return max(self.to_ms - self.from_ms, 0)
+
+
+def split_points(segments: list[Segment]) -> list[Piece]:
+    """Where to cut the finished mix so each song becomes one file.
+
+    The cut goes at the **end** of each overlap. That is the only split that
+    survives being played back as separate files: everything between two cuts
+    is one continuous stretch of the real mix, so playing the pieces in order
+    with no gap reproduces the mix exactly, sample for sample.
+
+    The consequence is worth being clear about. A piece holds the tail of its
+    own song *including the blend into the next one*, so the last seconds of
+    piece N already contain the opening of song N+1. That is what a blend is -
+    two songs sounding at once - and it cannot be otherwise while the files
+    play one after another rather than overlapping.
+
+    It also means playback has to be gapless. Any silence inserted between
+    files lands in the middle of a blend.
+    """
+    pieces: list[Piece] = []
+    for i, seg in enumerate(segments):
+        body = max(seg.end_ms - seg.start_ms, 0)
+        start = pieces[-1].to_ms if pieces else 0
+        pieces.append(Piece(index=i + 1, title=seg.title,
+                            from_ms=start, to_ms=seg.at_ms + body))
+    return pieces
+
+
+def render_solo(transitions: list, entry_for, rate: int = TARGET_RATE,
+                progress=None):
+    """Render each song on its own, edges shaped, no neighbour audio.
+
+    This cannot be done by slicing the finished mix: across an overlap the mix
+    holds both songs summed, and no cut separates them again. So each track is
+    rendered by itself here - its own slice, with the same head and tail
+    automation applied - and never added to anything.
+
+    The files then survive shuffling or playing alone, but the blends are gone:
+    a blend is two songs sounding at once, and that never happens when each
+    file holds one song. What is left is the running order, the trimmed start
+    and end points, and a fade at each edge.
+
+    Yields ``(Piece, audio)`` per track.
+    """
+    np = _np()
+    segments, report = plan(transitions, entry_for)
+    if report.missing:
+        raise RenderError("No local file for: " + ", ".join(report.missing))
+
+    def ms(v):
+        return int(round(v / 1000 * rate))
+
+    moves: dict[int, tuple[Move, Move]] = {}
+
+    def moves_for(i: int, n: int) -> tuple[Move, Move]:
+        if i not in moves:
+            t = transitions[i]
+            moves[i] = build_moves(np, n, t.ingredients, getattr(t, "automation", None))
+        return moves[i]
+
+    for i, seg in enumerate(segments):
+        if progress:
+            progress(i + 1, len(segments), seg.title)
+        audio = load_audio(seg.path, rate)
+        a = max(ms(seg.start_ms), 0)
+        b = min(max(ms(seg.end_ms), 0), len(audio))
+        if b <= a:
+            log.warning("Nothing to take from %s; skipping.", seg.title)
+            del audio
+            continue
+        body = audio[a:b].copy()
+        del audio
+
+        if i > 0 and segments[i - 1].overlap_ms:
+            n = min(ms(segments[i - 1].overlap_ms), len(body))
+            if n > 0:
+                _, in_move = moves_for(i - 1, ms(segments[i - 1].overlap_ms))
+                body[:n] = apply_move(np, body[:n], _truncate(in_move, n))
+        if seg.overlap_ms and i + 1 < len(segments):
+            n = min(ms(seg.overlap_ms), len(body))
+            if n > 0:
+                out_move, _ = moves_for(i, ms(seg.overlap_ms))
+                body[-n:] = apply_move(np, body[-n:], _truncate(out_move, n))
+
+        piece = Piece(index=i + 1, title=seg.title, from_ms=0,
+                      to_ms=int(len(body) / rate * 1000))
+        yield piece, body
+
+
+def write_solo(transitions: list, entry_for, out_dir: Path, suffix: str = ".wav",
+               rate: int = TARGET_RATE, progress=None) -> list[Path]:
+    """Write one standalone file per song."""
+    import soundfile as sf
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for piece, audio in render_solo(transitions, entry_for, rate, progress):
+        peak = float(abs(audio).max()) if len(audio) else 0.0
+        if peak > 0.97:
+            audio = audio * (0.97 / peak)
+        path = out_dir / piece_filename(piece, suffix)
+        sf.write(str(path), audio, rate)
+        written.append(path)
+    return written
+
+
+#: Characters Windows will not accept in a filename.
+_UNSAFE = str.maketrans({c: "-" for c in '<>:"/|?*' + chr(92)})
+
+
+def piece_filename(piece: Piece, suffix: str) -> str:
+    """A filename that sorts into playing order in any file browser."""
+    title = (piece.title or "track").translate(_UNSAFE).strip().rstrip(".")
+    return f"{piece.index:02d} - {title[:70]}{suffix}"
+
+
+def write_pieces(mix, pieces: list[Piece], out_dir: Path, suffix: str = ".wav",
+                 rate: int = TARGET_RATE) -> list[Path]:
+    """Cut the rendered mix into one file per song."""
+    import soundfile as sf
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for piece in pieces:
+        a = max(int(piece.from_ms / 1000 * rate), 0)
+        b = min(int(piece.to_ms / 1000 * rate), len(mix))
+        if b <= a:
+            log.warning("Piece %02d (%s) is empty; skipping.", piece.index, piece.title)
+            continue
+        path = out_dir / piece_filename(piece, suffix)
+        sf.write(str(path), mix[a:b], rate)
+        written.append(path)
+    return written

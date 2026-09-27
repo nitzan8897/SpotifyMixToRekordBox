@@ -7,6 +7,7 @@ and you do not want to learn to perform them.
 - [Running it](#running-it)
 - [What it reproduces](#what-it-reproduces)
 - [What it does not](#what-it-does-not)
+- [One file per song, for an autoplay playlist](#one-file-per-song-for-an-autoplay-playlist)
 - [Using a DJ controller over the render](#using-a-dj-controller-over-the-render)
 - [How the mixing works](#how-the-mixing-works)
 - [Troubleshooting](#troubleshooting)
@@ -35,6 +36,9 @@ Writes `mix.mp3` into the run folder. On a 25-track set expect under a minute.
 | Flag | Effect |
 | --- | --- |
 | `-o PATH` | Where to write. The extension picks the format: `.mp3`, `.wav`, `.flac`. |
+| `--separate` | One file per song instead of a single mix. See below. |
+| `--solo` | With `--separate`, each song alone, blends removed |
+| `--format EXT` | Format for `--separate` pieces: `wav` (default), `flac`, `mp3` |
 | `--music-dir DIR` | Override `paths.music_dir` |
 | `--no-align` | Do not shift for files that start with extra silence |
 | `-v` | Verbose |
@@ -91,6 +95,48 @@ the right song, the out point is the wrong musical moment and the blend will
 sound wrong. The render names those tracks. No render setting fixes it; the
 audio has to be replaced. See the main guide's section on
 [the one problem that ruins everything](transferring-a-spotify-mix.md#the-one-problem-that-ruins-everything).
+
+## One file per song, for an autoplay playlist
+
+```bash
+python phase4_render.py --separate --format flac
+```
+
+Writes a numbered file per song into `tracks/`. Put them in a playlist, turn on
+autoplay, and you hear the mix.
+
+**Gapless playback has to be on.** Each cut falls at the end of a blend, so the
+pieces tile the mix with no gap and no overlap: played back to back they
+reproduce it sample for sample, which the tests check by concatenating them and
+comparing against the continuous render. Any silence a player inserts between
+files lands in the middle of a blend.
+
+Use `wav` or `flac`. MP3 joins are not reliably gapless, because encoder padding
+adds a few milliseconds of silence at every join, which you hear as a click.
+
+One consequence worth understanding. The last seconds of each file already
+contain the opening of the next song, because a blend is two songs sounding at
+once, and that has to live in one file or the other when files play in sequence
+rather than overlapping. So the pieces are a mix cut into chapters, not 25
+independent songs. Shuffling them, or playing one alone, will sound odd at the
+end.
+
+### If you want genuinely standalone songs
+
+```bash
+python phase4_render.py --separate --solo --format flac
+```
+
+Each file then holds only its own song, trimmed to the mix's in and out points
+with a fade at each edge, written into `tracks_solo/`. These survive shuffling
+and play fine alone.
+
+What you lose is the blends. A blend is the moment two songs sound together,
+and that moment cannot exist when each file holds one song, so this is not a
+slice of the mix - each track is rendered separately. Played back to back you
+get the running order and the trimmed edges, not the transitions. On the set
+this was written against, solo runs 43:42 against the mix's 40:57; the
+difference is the overlaps that no longer happen.
 
 ## Using a DJ controller over the render
 

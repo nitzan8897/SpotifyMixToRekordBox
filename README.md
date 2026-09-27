@@ -47,6 +47,10 @@ python phase3_rekordbox.py           # -> rekordbox.xml, cues to perform
 `mix.mp3` is ready to play. Load it into rekordbox as a single track if you
 want to run a controller over the top of it.
 
+For an autoplay playlist instead of one long file, `python phase4_render.py
+--separate --format flac` writes a numbered file per song with the blends at
+their edges. Play them gapless in order and you hear the same mix.
+
 If you take the cue-point route instead, **turn off rekordbox's Automix and
 Fade In/Out** or it will add its own transitions on top of the imported cues.
 That trap and the rest of playback are covered in the

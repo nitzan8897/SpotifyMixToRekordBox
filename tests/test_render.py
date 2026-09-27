@@ -91,30 +91,57 @@ class VolumeEnvelopeTest(unittest.TestCase):
 class EqEnvelopeTest(unittest.TestCase):
     N = 1000
 
-    def test_centre_bass_swap_hands_the_low_end_over_at_the_midpoint(self):
+    def at(self, move, band, pos):
+        return float(getattr(move, band)[int(self.N * pos)])
+
+    def test_every_bass_swap_happens_inside_the_overlap(self):
+        """The bug this guards made a 7.4 s blend play with no bass at all.
+
+        With "start" at 0.0 and "end" at 1.0 the swap lands on the boundary and
+        never fires during the blend, so the incoming track kept a killed low
+        end for the whole overlap. Tuf Tuf into YUMMI sounded hollow for that
+        reason.
+        """
+        for style in ("start bass swap", "centre bass swap", "end bass swap"):
+            out, inc = render.eq_envelopes(np, self.N, style)
+            self.assertAlmostEqual(self.at(out, "low", 0.0), 1.0, msg=style)
+            self.assertAlmostEqual(self.at(out, "low", 0.99), 0.0, msg=style)
+            self.assertAlmostEqual(self.at(inc, "low", 0.0), 0.0, msg=style)
+            self.assertAlmostEqual(self.at(inc, "low", 0.99), 1.0, msg=style)
+
+    def test_the_three_swaps_differ_in_when_not_whether(self):
+        points = []
+        for style in ("start bass swap", "centre bass swap", "end bass swap"):
+            _, inc = render.eq_envelopes(np, self.N, style)
+            points.append(int(np.argmax(inc.low > 0.5)))
+        self.assertEqual(points, sorted(points))
+        self.assertEqual(len(set(points)), 3)
+
+    def test_a_bass_swap_leaves_mids_and_highs_alone(self):
+        """Only the low end changes hands; cutting the rest made it distant."""
         out, inc = render.eq_envelopes(np, self.N, "centre bass swap")
-        first, last = 10, self.N - 10
-        self.assertAlmostEqual(float(out.low[first]), 1.0)   # outgoing keeps its bass
-        self.assertAlmostEqual(float(inc.low[first]), 0.0)   # incoming has none
-        self.assertAlmostEqual(float(out.low[last]), 0.0)    # and afterwards, swapped
-        self.assertAlmostEqual(float(inc.low[last]), 1.0)
+        for move in (out, inc):
+            self.assertTrue(np.allclose(move.mid, 1.0))
+            self.assertTrue(np.allclose(move.high, 1.0))
 
-    def test_incoming_mids_and_highs_are_cut_not_killed(self):
-        _, inc = render.eq_envelopes(np, self.N, "centre bass swap")
-        self.assertAlmostEqual(float(inc.mid[0]), render.knob_to_gain(0.2))
-        self.assertGreater(float(inc.high[0]), 0.0)
-
-    def test_start_and_end_swaps_differ(self):
-        start_out, _ = render.eq_envelopes(np, self.N, "start bass swap")
-        end_out, _ = render.eq_envelopes(np, self.N, "end bass swap")
-        self.assertAlmostEqual(float(start_out.low[0]), 0.0)   # already handed over
-        self.assertAlmostEqual(float(end_out.low[0]), 1.0)     # holds to the end
+    def test_three_band_fade_is_a_step_not_a_ramp(self):
+        """Measured from the one transition whose real curves were captured."""
+        out, inc = render.eq_envelopes(np, self.N, "3 band fade")
+        # Low hands over at the midpoint.
+        self.assertAlmostEqual(self.at(out, "low", 0.25), 1.0)
+        self.assertAlmostEqual(self.at(out, "low", 0.75), 0.0)
+        # Mid and high step between unity and the 0.2 knob cut, both ways.
+        cut = render.knob_to_gain(render.BAND_CUT)
+        self.assertAlmostEqual(self.at(out, "mid", 0.25), 1.0)
+        self.assertAlmostEqual(self.at(out, "mid", 0.75), cut)
+        self.assertAlmostEqual(self.at(inc, "high", 0.25), cut)
+        self.assertAlmostEqual(self.at(inc, "high", 0.75), 1.0)
 
     def test_bass_fade_out_is_a_ramp_not_a_step(self):
         out, _ = render.eq_envelopes(np, self.N, "bass fade out")
-        self.assertAlmostEqual(float(out.low[0]), 1.0)
-        self.assertAlmostEqual(float(out.low[-1]), 0.0)
-        self.assertAlmostEqual(float(out.low[self.N // 2]), 0.5, places=2)
+        self.assertAlmostEqual(self.at(out, "low", 0.0), 1.0)
+        self.assertAlmostEqual(self.at(out, "low", 0.5), 0.5, places=2)
+        self.assertLess(self.at(out, "low", 0.99), 0.02)
 
     def test_no_eq_setting_leaves_every_band_alone(self):
         out, inc = render.eq_envelopes(np, self.N, None)
@@ -275,3 +302,61 @@ class NormalizeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SplitTest(unittest.TestCase):
+    """Cutting the mix into one file per song."""
+
+    def segments(self):
+        # Three songs: bodies 100/90/80 s, overlaps 5/4 s.
+        segs = [
+            render.Segment("A", Path("a.mp3"), 0, 100_000, 5_000),
+            render.Segment("B", Path("b.mp3"), 0, 90_000, 4_000),
+            render.Segment("C", Path("c.mp3"), 0, 80_000, 0),
+        ]
+        at = 0
+        for s in segs:
+            s.at_ms = at
+            at += (s.end_ms - s.start_ms) - s.overlap_ms
+        return segs
+
+    def test_pieces_tile_the_mix_with_no_gap_or_overlap(self):
+        """Played gapless in order they must reproduce the mix exactly."""
+        pieces = render.split_points(self.segments())
+        self.assertEqual(pieces[0].from_ms, 0)
+        for earlier, later in zip(pieces, pieces[1:]):
+            self.assertEqual(earlier.to_ms, later.from_ms)
+
+    def test_a_piece_ends_after_its_blend_so_the_blend_survives(self):
+        segs = self.segments()
+        pieces = render.split_points(segs)
+        # Song A's piece runs to the end of its 5 s overlap, i.e. its full body.
+        self.assertEqual(pieces[0].to_ms, 100_000)
+        # Which is 5 s past where song B started sounding.
+        self.assertEqual(segs[1].at_ms, 95_000)
+
+    def test_total_length_matches_the_mix(self):
+        segs = self.segments()
+        pieces = render.split_points(segs)
+        end = max(s.at_ms + (s.end_ms - s.start_ms) for s in segs)
+        self.assertEqual(pieces[-1].to_ms, end)
+        self.assertEqual(sum(p.duration_ms for p in pieces), end)
+
+    def test_solo_rendering_is_not_a_slice_of_the_mix(self):
+        """Across an overlap the mix holds both songs summed and cannot be cut
+        apart again, so solo files need their own render pass."""
+        self.assertFalse(hasattr(render, "solo_points"))
+        self.assertTrue(callable(render.render_solo))
+
+    def test_every_piece_is_named_in_playing_order(self):
+        pieces = render.split_points(self.segments())
+        names = [render.piece_filename(p, ".wav") for p in pieces]
+        self.assertEqual(names, sorted(names))
+        self.assertTrue(names[0].startswith("01 - "))
+
+    def test_filenames_drop_characters_windows_refuses(self):
+        piece = render.Piece(index=3, title='Pike: Remix / "Mix" *?', from_ms=0, to_ms=1)
+        name = render.piece_filename(piece, ".wav")
+        for bad in '<>:"/|?*' + chr(92):
+            self.assertNotIn(bad, name)
+        self.assertTrue(name.endswith(".wav"))

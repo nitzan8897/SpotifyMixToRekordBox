@@ -37,7 +37,8 @@ from pathlib import Path
 from src.config import ConfigError, load_config
 from src.logs import setup_logging
 from src.rekordbox import build_entries, scan_music_dirs, _track_key
-from src.render import RenderError, normalize, render, write
+from src.render import (RenderError, normalize, plan, render, split_points, write,
+                        write_pieces, write_solo)
 from src.transitions import ExtractError
 
 from phase3_rekordbox import load_transitions, newest_run
@@ -60,6 +61,17 @@ def main() -> int:
     ap.add_argument("-o", "--output", default=None, metavar="PATH",
                     help="where to write the mix (default: <run>/mix.mp3). The extension "
                          "picks the format: .mp3, .wav or .flac.")
+    ap.add_argument("--separate", action="store_true",
+                    help="write one file per song instead of a single mix, numbered in playing "
+                         "order, with the blends already at their edges. Play them gapless in "
+                         "order and you hear the mix. Use this for an autoplay playlist.")
+    ap.add_argument("--solo", action="store_true",
+                    help="with --separate, cut each song before the next one enters, so a file "
+                         "only ever holds that one song. Survives shuffling, but loses the "
+                         "blends - the moment two songs sound together is cut out.")
+    ap.add_argument("--format", default="wav", metavar="EXT",
+                    help="format for --separate pieces: wav (default), flac or mp3. wav and "
+                         "flac play gapless reliably; mp3 can insert a gap at every join.")
     ap.add_argument("--no-align", action="store_true",
                     help="do not shift cues onto files that start with extra silence")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -118,12 +130,49 @@ def main() -> int:
         return 1
 
     mix, peak = normalize(mix)
-    out_path = Path(args.output).resolve() if args.output else run_dir / "mix.mp3"
-    write(mix, out_path)
 
-    log.info("")
-    log.info("Written: %s", out_path)
-    log.info("Length:  %s", _hms(report.duration_ms))
+    if args.separate:
+        out_dir = (Path(args.output).resolve() if args.output
+                   else run_dir / ("tracks_solo" if args.solo else "tracks"))
+        suffix = "." + args.format.lower().lstrip(".")
+        if args.solo:
+            written = write_solo(transitions, entry_for, out_dir, suffix, progress=progress)
+            pieces = None
+        else:
+            segments, _ = plan(transitions, entry_for)
+            pieces = split_points(segments)
+            written = write_pieces(mix, pieces, out_dir, suffix)
+
+        log.info("")
+        log.info("Written %d file(s) to %s", len(written), out_dir)
+        if pieces:
+            for piece, path in zip(pieces, written):
+                log.info("   %02d  %5.1fs  %s", piece.index, piece.duration_ms / 1000, path.name)
+        else:
+            for path in written:
+                log.info("   %s", path.name)
+        log.info("")
+        if args.solo:
+            log.info("Each file holds only its own song. The blends are not in them - playing "
+                     "these back to back gives you the running order and the trimmed "
+                     "start/end points, not the transitions.")
+        else:
+            log.info("Play these in order with GAPLESS playback on and you hear the mix exactly. "
+                     "The last seconds of each file already contain the start of the next song, "
+                     "because that is what a blend is. Any gap inserted between files lands in "
+                     "the middle of one.")
+            if suffix == ".mp3":
+                log.warning("MP3 joins are not reliably gapless - encoder padding can add a few "
+                            "milliseconds of silence at every join. Use --format wav or flac if "
+                            "you hear clicks.")
+        log.info("Length: %s across %d file(s)", _hms(report.duration_ms), len(written))
+    else:
+        out_path = Path(args.output).resolve() if args.output else run_dir / "mix.mp3"
+        write(mix, out_path)
+        log.info("")
+        log.info("Written: %s", out_path)
+        log.info("Length:  %s", _hms(report.duration_ms))
+
     if peak > 0.97:
         log.info("Peak was %.2f before normalising, so the mix was turned down to fit.", peak)
 
@@ -142,8 +191,7 @@ def main() -> int:
         log.warning("Run: python phase0_download.py --check-only")
 
     log.info("")
-    log.info("Took %.0fs. Play it anywhere, or load it into rekordbox as one track "
-             "to run a controller over the top.", time.time() - started)
+    log.info("Took %.0fs.", time.time() - started)
     return 0
 
 
