@@ -180,10 +180,26 @@ def main() -> int:
         log.info("Looping applied on %d transition(s): %s",
                  len(report.loops_applied), ", ".join(report.loops_applied))
 
-    if report.effects_skipped:
-        log.warning("%d transition(s) use an Effects setting, which is not rendered. They blend "
+    if report.loudness_trims:
+        moved = {k: v for k, v in report.loudness_trims.items() if abs(v) >= 1.0}
+        log.info("Loudness matched across %d track(s); %d needed more than 1 dB.",
+                 len(report.loudness_trims), len(moved))
+        for path, db in sorted(moved.items(), key=lambda kv: -abs(kv[1]))[:6]:
+            log.info("   %+5.1f dB  %s", db, Path(path).name)
+
+    if report.filters_applied:
+        log.info("Filter sweep on %d transition(s): %s",
+                 len(report.filters_applied), ", ".join(report.filters_applied))
+    if report.reverbs_applied:
+        log.info("Reverb tail on %d transition(s): %s",
+                 len(report.reverbs_applied), ", ".join(report.reverbs_applied))
+
+    still_missing = [e for e in report.effects_skipped
+                     if "echo" in e and e.split()[0] not in report.reverbs_applied]
+    if still_missing:
+        log.warning("%d transition(s) use an echo, which is not rendered. They blend "
                     "correctly but without the tail: %s",
-                    len(report.effects_skipped), ", ".join(report.effects_skipped))
+                    len(still_missing), ", ".join(still_missing))
 
     if report.wrong_edit:
         log.warning("")

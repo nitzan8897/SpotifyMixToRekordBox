@@ -323,6 +323,322 @@ def apply_move(np, chunk, move: Move):
 
 
 # --------------------------------------------------------------------------
+# Filter and reverb
+# --------------------------------------------------------------------------
+# These are the two ingredients that make a blend sound deliberate rather than
+# like one track stopping and the next starting. Without them an "Overlap"
+# volume setting - both tracks at full, then a cut - lands as an abrupt change,
+# which is exactly how it sounded before this existed.
+#
+# Both are reported by the player, per transition, as curves:
+#   filter_cutoff / filter_resonance   0..1, 0.5 neutral
+#   reverb_dry_wet and five more       the reverb's settings, decay in ms
+# and both are rebuilt from the ingredient name when no curves were captured.
+
+#: The sweep a filter curve covers. 0.5 is neutral - no filtering - and the
+#: value moves toward one end or the other.
+FILTER_MIN_HZ = 60.0
+FILTER_MAX_HZ = 18000.0
+#: How far the resonance control can lift the filter's Q.
+FILTER_MAX_Q = 4.0
+
+
+def _cutoff_hz(value: float, high_pass: bool) -> float:
+    """Map a 0..1 filter position to a corner frequency.
+
+    At 0.5 the filter is out of the way, so a high-pass sits at its lowest
+    corner and a low-pass at its highest. Away from neutral the corner sweeps
+    in, taking the band with it.
+    """
+    amount = max(0.0, (0.5 - value) / 0.5) if not high_pass else max(0.0, (value - 0.5) / 0.5)
+    amount = min(amount, 1.0)
+    if high_pass:
+        return FILTER_MIN_HZ * (FILTER_MAX_HZ / FILTER_MIN_HZ) ** amount
+    return FILTER_MAX_HZ * (FILTER_MIN_HZ / FILTER_MAX_HZ) ** amount
+
+
+def sweep_filter(np, chunk, cutoff, resonance, high_pass: bool,
+                 rate: int = TARGET_RATE, hop_ms: int = 25):
+    """Apply a moving filter across a chunk.
+
+    A sweeping filter cannot be one fixed biquad, and refiltering every sample
+    with new coefficients is far too slow. So the chunk is cut into short hops,
+    each filtered at its own corner frequency, and the hops are crossfaded into
+    each other - short enough that the sweep sounds continuous, long enough to
+    stay cheap.
+    """
+    from scipy.signal import butter, sosfilt
+
+    n = len(chunk)
+    hop = max(int(hop_ms / 1000 * rate), 256)
+    out = np.zeros_like(chunk)
+    window = np.hanning(2 * hop)[:, None].astype(np.float32)
+    rise, fall = window[:hop], window[hop:]
+
+    pos = 0
+    while pos < n:
+        end = min(pos + hop, n)
+        mid = (pos + end) / 2 / max(n - 1, 1)
+        c = float(np.interp(mid, np.linspace(0, 1, len(cutoff)), cutoff))
+        q = float(np.interp(mid, np.linspace(0, 1, len(resonance)), resonance))
+        hz = _cutoff_hz(c, high_pass)
+        # Neutral means leave it alone, which also avoids a pointless filter
+        # pass over most of a transition.
+        if abs(c - 0.5) < 0.01:
+            piece = chunk[pos:end]
+        else:
+            q_lift = 0.7071 + max(0.0, (q - 0.5) / 0.5) * (FILTER_MAX_Q - 0.7071)
+            sos = butter(2, min(max(hz / (rate / 2), 1e-4), 0.99),
+                         btype="high" if high_pass else "low", output="sos")
+            pad = min(hop, pos)
+            filtered = sosfilt(sos, chunk[pos - pad:end], axis=0)
+            piece = filtered[pad:] if pad else filtered
+        take = len(piece)
+        seg = piece.copy()
+        if pos > 0 and take >= hop:
+            seg[:hop] *= rise
+        if end < n and take >= hop:
+            seg[-hop:] *= fall
+        out[pos:pos + take] += seg
+        pos += hop
+    return out
+
+
+#: Delay lengths for the reverb's comb filters, in seconds. Mutually prime-ish
+#: so their repeats do not line up into an audible pitch.
+_COMB_S = (0.0297, 0.0371, 0.0411, 0.0437)
+_ALLPASS_S = (0.0050, 0.0017)
+
+
+def reverb(np, chunk, decay_ms: float, damping: float, room: float,
+           rate: int = TARGET_RATE):
+    """A Schroeder reverb: parallel combs into series allpasses.
+
+    Enough to put a tail on a track that is leaving, which is what the Effects
+    ingredient is for. It is not a convincing room, and does not need to be -
+    the tail is what carries a transition over the gap, and its length and
+    damping come from the player's own reported values.
+    """
+    from scipy.signal import lfilter
+
+    decay_s = max(decay_ms, 100.0) / 1000.0
+    mono = chunk.mean(axis=1)
+    wet = np.zeros_like(mono)
+
+    for base in _COMB_S:
+        delay = max(int(base * (0.7 + 0.6 * room) * rate), 1)
+        # Feedback that decays by 60 dB over the reported decay time.
+        feedback = float(np.clip(10 ** (-3.0 * delay / (decay_s * rate)), 0.0, 0.97))
+        a = np.zeros(delay + 1, dtype=np.float64)
+        a[0], a[delay] = 1.0, -feedback * (1.0 - 0.6 * damping)
+        wet += lfilter([1.0], a, mono).astype(np.float32)
+    wet /= len(_COMB_S)
+
+    for base in _ALLPASS_S:
+        delay = max(int(base * rate), 1)
+        g = 0.7
+        b = np.zeros(delay + 1); b[0], b[delay] = g, 1.0
+        a = np.zeros(delay + 1); a[0], a[delay] = 1.0, g
+        wet = lfilter(b, a, wet).astype(np.float32)
+
+    return np.repeat(wet[:, None], 2, axis=1)
+
+
+def _curve_samples(np, segs, n: int, default: float) -> object:
+    """Sample a curve across the overlap, or a flat line when there is none."""
+    if not segs:
+        return np.full(n, default, dtype=np.float32)
+    pos = np.linspace(0.0, 1.0, n)
+    return np.array([value_at(segs, float(p)) if value_at(segs, float(p)) is not None
+                     else default for p in pos], dtype=np.float32)
+
+
+def apply_filter_sweep(np, chunk, side, ingredients: dict, which: str,
+                       rate: int = TARGET_RATE):
+    """Put the Filter ingredient onto one side of a blend.
+
+    A filter is an insert, so this runs before the volume and EQ move. ``side``
+    is the player's reported automation when there is any; otherwise the sweep
+    is rebuilt from the name the editor showed.
+
+    Returns None when the filter is neutral and nothing was done. An earlier
+    version returned the chunk unchanged and left the caller to spot it with
+    ``is not``, which never worked: ``body[-n:]`` builds a fresh slice object
+    every time it is evaluated, so the comparison was always true and the run
+    reported a filter on all 26 transitions when only 16 have one.
+    """
+    n = len(chunk)
+    if n < 64:
+        return None
+    cutoff = _curve_samples(np, side.extra.get("filter_cutoff") if side else None, n, 0.5)
+    resonance = _curve_samples(np, side.extra.get("filter_resonance") if side else None,
+                               n, 0.5)
+    named = ((ingredients or {}).get("filter") or {}).get("value")
+    if float(np.abs(cutoff - 0.5).max()) < 0.01 and named:
+        cutoff = _named_filter_curve(np, n, named, which)
+    if float(np.abs(cutoff - 0.5).max()) < 0.01:
+        return None          # neutral: nothing to do, and the caller must know
+    high_pass = bool(cutoff.max() > 0.5 + 1e-6)
+    return sweep_filter(np, chunk, cutoff, resonance, high_pass, rate)
+
+
+def reverb_send(np, dry, side, ingredients: dict, rate: int = TARGET_RATE):
+    """The reverb tail for a track that is leaving, or None if it has none.
+
+    Returned separately so the caller can add it *after* the volume move. That
+    ordering is the whole point of the effect: the tail has to keep sounding
+    while the dry track is cut away, which is what "Reverb cut end" means. Fade
+    the tail with the fader and it disappears exactly when it should be heard.
+    """
+    n = len(dry)
+    if n < 64:
+        return None
+    wet_curve = _curve_samples(np, side.extra.get("reverb_dry_wet") if side else None,
+                               n, 0.0)
+    effect = ((ingredients or {}).get("effects") or {}).get("value") or ""
+    if float(wet_curve.max()) < 0.01 and "reverb" in effect:
+        wet_curve = _ramp(np, n, 0.0, 0.5)
+    if float(wet_curve.max()) < 0.01:
+        return None
+    decay = _first_value(side, "reverb_decay_time", 2500.0)
+    damping = _first_value(side, "reverb_damping", 0.2)
+    room = _first_value(side, "reverb_room_size", 0.5)
+    return reverb(np, dry, decay, damping, room, rate) * wet_curve[:, None]
+
+
+def _first_value(side, name: str, default: float) -> float:
+    if side is None:
+        return default
+    v = value_at(side.extra.get(name) or [], 0.0)
+    return float(v) if v is not None else default
+
+
+def _named_filter_curve(np, n: int, named: str, which: str):
+    """Rebuild a filter sweep from the editor's wording."""
+    parts = [p.strip() for p in named.split("+")]
+    mine = [p for p in parts if p.endswith(" " + ("in" if which == "in" else "out"))]
+    if not mine:
+        return np.full(n, 0.5, dtype=np.float32)
+    part = mine[0]
+    # A high-pass sweeps up from neutral; a low-pass sweeps down.
+    far = 1.0 if part.startswith("high pass") else 0.0
+    # "in" means the filter opens back up over the overlap; "out" means it
+    # closes in as the track leaves.
+    return (_ramp(np, n, far, 0.5) if which == "in" else _ramp(np, n, 0.5, far))
+
+
+# --------------------------------------------------------------------------
+# Loudness matching
+# --------------------------------------------------------------------------
+# Spotify plays every track at a common loudness, so a quiet master and a
+# crushed one sit at the same level. A render straight off the files does not,
+# and the difference is not subtle: across one 27-track playlist the quietest
+# track measured -13.9 LUFS against +0.7 for the loudest, a 14.6 dB spread.
+# Sean Paul's "Temperature" was the quiet one, and it audibly dropped out of
+# the mix.
+#
+# Loudness here follows ITU-R BS.1770: K-weight the audio, take the mean square
+# over 400 ms blocks, then gate away the quiet ones so a track with long intros
+# is not measured as quieter than it plays.
+LOUDNESS_BLOCK_S = 0.400
+LOUDNESS_STEP_S = 0.100
+#: Blocks below this are silence and never count.
+ABSOLUTE_GATE_LUFS = -70.0
+#: And blocks more than this far below the ungated average are too quiet to
+#: represent the track.
+RELATIVE_GATE_DB = 10.0
+#: Never move a track by more than this, however far off it measures. A gain
+#: that large means the measurement is being asked to fix something it cannot.
+MAX_TRIM_DB = 12.0
+
+
+def _k_weight(np, x, rate: int):
+    """The BS.1770 weighting: a high shelf, then a high-pass at 38 Hz.
+
+    It approximates how loud something actually sounds, which plain RMS does
+    not - RMS rates a bass-heavy master far louder than it plays.
+    """
+    from scipy.signal import butter, lfilter, sosfilt
+
+    f0, gain_db, q = 1681.97, 3.999, 0.7071
+    k = np.tan(np.pi * f0 / rate)
+    v = 10 ** (gain_db / 20)
+    root = np.sqrt(2 * v)
+    b = np.array([v * (1 + root * k + v * k * k),
+                  2 * v * (v * k * k - 1),
+                  v * (1 - root * k + v * k * k)])
+    a = np.array([1 + k / q + k * k, 2 * (k * k - 1), 1 - k / q + k * k])
+    shelved = lfilter(b / a[0], a / a[0], x, axis=0)
+    sos = butter(2, 38.0 / (rate / 2), btype="high", output="sos")
+    return sosfilt(sos, shelved, axis=0)
+
+
+def measure_loudness(audio, rate: int = TARGET_RATE) -> float | None:
+    """Integrated loudness in LUFS, or None if there is nothing to measure."""
+    np = _np()
+    try:
+        import scipy.signal  # noqa: F401
+    except ImportError:
+        return None
+    if audio is None or len(audio) < int(LOUDNESS_BLOCK_S * rate):
+        return None
+
+    weighted = _k_weight(np, audio, rate)
+    block = int(LOUDNESS_BLOCK_S * rate)
+    step = int(LOUDNESS_STEP_S * rate)
+    starts = np.arange(0, len(weighted) - block + 1, step)
+    if not len(starts):
+        return None
+    # Sum the channels' mean squares, as the standard specifies.
+    power = np.array([np.mean(weighted[i:i + block] ** 2, axis=0).sum() for i in starts])
+    loud = -0.691 + 10 * np.log10(power + 1e-12)
+
+    above_absolute = loud[loud > ABSOLUTE_GATE_LUFS]
+    if not len(above_absolute):
+        return None
+    ungated = -0.691 + 10 * np.log10(np.mean(10 ** ((above_absolute + 0.691) / 10)))
+    kept = above_absolute[above_absolute > ungated - RELATIVE_GATE_DB]
+    use = kept if len(kept) else above_absolute
+    return float(-0.691 + 10 * np.log10(np.mean(10 ** ((use + 0.691) / 10))))
+
+
+def loudness_trims(segments: list, rate: int = TARGET_RATE,
+                   progress=None) -> dict[str, float]:
+    """A gain per file, in dB, that brings every track to a common loudness.
+
+    The target is the set's own median rather than a fixed figure: it keeps the
+    mix at roughly the level of the material and asks for the smallest moves,
+    where aiming at a fixed target would push a whole playlist of loud masters
+    down or a quiet one up into a limiter.
+    """
+    np = _np()
+    measured: dict[str, float] = {}
+    for i, seg in enumerate(segments):
+        key = str(seg.path)
+        if key in measured:
+            continue
+        if progress:
+            progress(i + 1, len(segments), seg.title)
+        value = measure_loudness(load_audio(seg.path, rate), rate)
+        if value is not None:
+            measured[key] = value
+    if not measured:
+        return {}
+
+    target = float(np.median(list(measured.values())))
+    trims = {}
+    for key, value in measured.items():
+        trims[key] = float(np.clip(target - value, -MAX_TRIM_DB, MAX_TRIM_DB))
+    log.info("Loudness: target %.1f LUFS, spread %.1f dB across %d track(s).",
+             target, max(measured.values()) - min(measured.values()), len(measured))
+    return trims
+
+
+def db_to_gain(db: float) -> float:
+    return float(10 ** (db / 20))
+
+
+# --------------------------------------------------------------------------
 # Assembling the whole mix
 # --------------------------------------------------------------------------
 @dataclass
@@ -346,6 +662,9 @@ class RenderReport:
     duration_ms: int = 0
     effects_skipped: list = field(default_factory=list)
     loops_applied: list = field(default_factory=list)
+    loudness_trims: dict = field(default_factory=dict)
+    filters_applied: list = field(default_factory=list)
+    reverbs_applied: list = field(default_factory=list)
     wrong_edit: list = field(default_factory=list)
     missing: list = field(default_factory=list)
     peak: float = 0.0
@@ -426,7 +745,7 @@ def load_duration_ms(path: Path) -> int | None:
 
 
 def render(transitions: list, entry_for, rate: int = TARGET_RATE,
-           progress=None) -> tuple[object, RenderReport]:
+           progress=None, match_loudness: bool = True) -> tuple[object, RenderReport]:
     """Mix the whole thing down to one stereo array.
 
     Each track contributes one slice. The last ``overlap`` of a slice is the
@@ -442,6 +761,11 @@ def render(transitions: list, entry_for, rate: int = TARGET_RATE,
     segments, report = plan(transitions, entry_for)
     if report.missing:
         raise RenderError("No local file for: " + ", ".join(report.missing))
+
+    # Every track is brought to a common loudness before anything is mixed, so
+    # the blends are shaped on audio that already sits at the right level.
+    trims = loudness_trims(segments, rate, progress) if match_loudness else {}
+    report.loudness_trims = dict(trims)
 
     # A second of slack so a segment that runs a touch long is not clipped by
     # the buffer; the mix is trimmed back to its real length before returning.
@@ -476,10 +800,23 @@ def render(transitions: list, entry_for, rate: int = TARGET_RATE,
         body = audio[a:b].copy()
         del audio
 
+        # Bring this track to the mix's loudness before anything else, so the
+        # blends are shaped on audio that is already at the right level.
+        trim = trims.get(str(seg.path))
+        if trim:
+            body *= db_to_gain(trim)
+
         # Blend out of the previous track: shape the head of this slice.
         if i > 0 and segments[i - 1].overlap_ms:
             n = min(ms(segments[i - 1].overlap_ms), len(body))
             if n > 0:
+                prev = transitions[i - 1]
+                prev_auto = getattr(prev, "automation", None)
+                head = apply_filter_sweep(np, body[:n],
+                                          prev_auto.incoming if prev_auto else None,
+                                          prev.ingredients, "in", rate)
+                if head is not None:
+                    body[:n] = head
                 _, in_move = moves_for(i - 1, ms(segments[i - 1].overlap_ms))
                 body[:n] = apply_move(np, body[:n], _truncate(in_move, n))
 
@@ -488,15 +825,27 @@ def render(transitions: list, entry_for, rate: int = TARGET_RATE,
             n = min(ms(seg.overlap_ms), len(body))
             if n > 0:
                 trans = transitions[i]
+                auto = getattr(trans, "automation", None)
+                out_side = auto.outgoing if auto else None
                 # The Looping ingredient first: the roll replaces the audio
-                # under the blend, so it has to happen before the fades and
-                # EQ are applied on top of it.
-                roll = roll_ms_from(getattr(trans, "automation", None), trans)
+                # under the blend, so everything else sits on top of it.
+                roll = roll_ms_from(auto, trans)
                 if roll and roll < seg.overlap_ms:
                     body[-n:] = apply_roll(np, body[-n:], roll, rate)
                     report.loops_applied.append(f"{i + 1:02d} {roll} ms")
+                # Filter next: an insert, so before the fader.
+                filtered = apply_filter_sweep(np, body[-n:], out_side,
+                                              trans.ingredients, "out", rate)
+                if filtered is not None:
+                    body[-n:] = filtered
+                    report.filters_applied.append(f"{i + 1:02d}")
+                tail = reverb_send(np, body[-n:], out_side, trans.ingredients, rate)
                 out_move, _ = moves_for(i, ms(seg.overlap_ms))
                 body[-n:] = apply_move(np, body[-n:], _truncate(out_move, n))
+                # And the reverb after the fader, so the tail outlives the cut.
+                if tail is not None:
+                    body[-n:] += tail
+                    report.reverbs_applied.append(f"{i + 1:02d}")
 
         _add(mix, body, ms(seg.at_ms))
 
@@ -574,7 +923,7 @@ def split_points(segments: list[Segment]) -> list[Piece]:
 
 
 def render_solo(transitions: list, entry_for, rate: int = TARGET_RATE,
-                progress=None):
+                progress=None, match_loudness: bool = True):
     """Render each song on its own, edges shaped, no neighbour audio.
 
     This cannot be done by slicing the finished mix: across an overlap the mix
@@ -597,6 +946,8 @@ def render_solo(transitions: list, entry_for, rate: int = TARGET_RATE,
     def ms(v):
         return int(round(v / 1000 * rate))
 
+    trims = loudness_trims(segments, rate) if match_loudness else {}
+
     moves: dict[int, tuple[Move, Move]] = {}
 
     def moves_for(i: int, n: int) -> tuple[Move, Move]:
@@ -617,6 +968,9 @@ def render_solo(transitions: list, entry_for, rate: int = TARGET_RATE,
             continue
         body = audio[a:b].copy()
         del audio
+        trim = trims.get(str(seg.path))
+        if trim:
+            body *= db_to_gain(trim)
 
         if i > 0 and segments[i - 1].overlap_ms:
             n = min(ms(segments[i - 1].overlap_ms), len(body))

@@ -434,3 +434,225 @@ class RollLengthTest(unittest.TestCase):
         self.assertEqual(render.loop_ms_from_beats(8, 170), 2824)
         self.assertIsNone(render.loop_ms_from_beats(None, 170))
         self.assertIsNone(render.loop_ms_from_beats(2, None))
+
+
+class LoudnessTest(unittest.TestCase):
+    """Bringing every track to a common loudness, the way Spotify plays them."""
+
+    RATE = 44100
+
+    def tone(self, amplitude, seconds=3.0, hz=1000.0):
+        t = np.arange(int(seconds * self.RATE)) / self.RATE
+        mono = (amplitude * np.sin(2 * np.pi * hz * t)).astype(np.float32)
+        return mono[:, None] * np.ones((1, 2), np.float32)
+
+    def test_a_quieter_signal_measures_quieter(self):
+        loud = render.measure_loudness(self.tone(0.5), self.RATE)
+        quiet = render.measure_loudness(self.tone(0.05), self.RATE)
+        self.assertIsNotNone(loud)
+        self.assertLess(quiet, loud)
+
+    def test_halving_amplitude_costs_about_six_dB(self):
+        a = render.measure_loudness(self.tone(0.4), self.RATE)
+        b = render.measure_loudness(self.tone(0.2), self.RATE)
+        self.assertAlmostEqual(a - b, 6.0, delta=0.5)
+
+    def test_silence_has_no_measurable_loudness(self):
+        silence = np.zeros((self.RATE * 2, 2), dtype=np.float32)
+        self.assertIsNone(render.measure_loudness(silence, self.RATE))
+
+    def test_too_short_to_measure(self):
+        self.assertIsNone(render.measure_loudness(self.tone(0.5, seconds=0.1), self.RATE))
+
+    def test_quiet_passages_do_not_drag_the_measurement_down(self):
+        """A track with a long quiet intro plays as loud as its body."""
+        body = self.tone(0.4, seconds=6.0)
+        intro = self.tone(0.0005, seconds=6.0)
+        with_intro = np.concatenate([intro, body])
+        self.assertAlmostEqual(render.measure_loudness(body, self.RATE),
+                               render.measure_loudness(with_intro, self.RATE),
+                               delta=1.5)
+
+    def test_db_to_gain(self):
+        self.assertAlmostEqual(render.db_to_gain(0.0), 1.0)
+        self.assertAlmostEqual(render.db_to_gain(6.0), 2.0, places=2)
+        self.assertAlmostEqual(render.db_to_gain(-6.0), 0.5, places=2)
+
+
+class LoudnessTrimTest(unittest.TestCase):
+    """Turning measurements into a gain per file."""
+
+    def segments(self, paths):
+        return [render.Segment(f"t{i}", Path(p), 0, 1000, 0) for i, p in enumerate(paths)]
+
+    def trims(self, by_path):
+        real_measure, real_load = render.measure_loudness, render.load_audio
+        render.load_audio = lambda p, rate=render.TARGET_RATE: str(p)
+        render.measure_loudness = lambda audio, rate=render.TARGET_RATE: by_path[audio]
+        try:
+            return render.loudness_trims(self.segments(by_path))
+        finally:
+            render.measure_loudness, render.load_audio = real_measure, real_load
+
+    def test_the_target_is_the_median_so_moves_stay_small(self):
+        trims = self.trims({"a.mp3": -10.0, "b.mp3": -5.0, "c.mp3": 0.0})
+        self.assertAlmostEqual(trims["b.mp3"], 0.0)       # the median moves not at all
+        self.assertAlmostEqual(trims["a.mp3"], 5.0)       # quiet one comes up
+        self.assertAlmostEqual(trims["c.mp3"], -5.0)      # loud one comes down
+
+    def test_the_quiet_outlier_is_lifted(self):
+        """Temperature measured 10.2 dB below this playlist's median."""
+        trims = self.trims({"temperature.mp3": -10.9, "b.mp3": -0.7, "c.mp3": 3.7})
+        self.assertGreater(trims["temperature.mp3"], 9.0)
+
+    def test_a_trim_is_capped(self):
+        trims = self.trims({"a.mp3": -40.0, "b.mp3": 0.0, "c.mp3": 0.0})
+        self.assertLessEqual(trims["a.mp3"], render.MAX_TRIM_DB)
+
+    def test_one_file_used_twice_is_measured_once(self):
+        calls = []
+        real_measure, real_load = render.measure_loudness, render.load_audio
+        render.load_audio = lambda p, rate=render.TARGET_RATE: str(p)
+        render.measure_loudness = lambda audio, rate=render.TARGET_RATE: (
+            calls.append(audio) or -5.0)
+        try:
+            segs = self.segments(["same.mp3", "same.mp3", "other.mp3"])
+            render.loudness_trims(segs)
+        finally:
+            render.measure_loudness, render.load_audio = real_measure, real_load
+        self.assertEqual(len(calls), 2)
+
+    def test_nothing_measurable_yields_no_trims(self):
+        real_measure, real_load = render.measure_loudness, render.load_audio
+        render.load_audio = lambda p, rate=render.TARGET_RATE: str(p)
+        render.measure_loudness = lambda audio, rate=render.TARGET_RATE: None
+        try:
+            self.assertEqual(render.loudness_trims(self.segments(["a.mp3"])), {})
+        finally:
+            render.measure_loudness, render.load_audio = real_measure, real_load
+
+
+class RenderIntegrationTest(unittest.TestCase):
+    """render() end to end on synthetic audio.
+
+    Worth having because the unit tests above pass whether or not render()
+    actually calls any of them. Twice now a patch to render() silently failed
+    to apply - once leaving the loudness trims unused, which only surfaced as a
+    NameError mid-render - and nothing in the suite noticed.
+    """
+    RATE = 44100
+
+    def setUp(self):
+        self.real_load = render.load_audio
+        self.real_dur = render.load_duration_ms
+        # Two tracks 30 s long, one much quieter than the other.
+        t = np.arange(int(30 * self.RATE)) / self.RATE
+        wave = np.sin(2 * np.pi * 220 * t).astype(np.float32)
+        self.audio = {
+            "loud.mp3": (wave * 0.5)[:, None] * np.ones((1, 2), np.float32),
+            "quiet.mp3": (wave * 0.05)[:, None] * np.ones((1, 2), np.float32),
+        }
+        render.load_audio = lambda p, rate=render.TARGET_RATE: self.audio[Path(p).name].copy()
+        render.load_duration_ms = lambda p: 30_000
+
+    def tearDown(self):
+        render.load_audio = self.real_load
+        render.load_duration_ms = self.real_dur
+
+    def transitions(self):
+        t = Transition(index=0, snapshot="", from_track=Track(title="Loud", bpm=120),
+                       to_track=Track(title="Quiet", bpm=120),
+                       out_point_ms=20_000, in_point_ms=0, overlap_ms=4_000,
+                       ingredients={"volume": {"raw": "Overlap", "value": "overlap",
+                                               "off": False}})
+        return [t]
+
+    def entries(self):
+        class E:
+            def __init__(self, path):
+                self.local_path = Path(path)
+                self.offset_ms = 0
+
+            def is_different_edit(self):
+                return False
+        return {"Loud": E("loud.mp3"), "Quiet": E("quiet.mp3")}
+
+    def render(self, **kw):
+        by = self.entries()
+        return render.render(self.transitions(), lambda tr: by[tr.title], **kw)
+
+    def test_it_produces_audio_of_the_expected_length(self):
+        mix, report = self.render(match_loudness=False)
+        # 24 s of Loud (out point + overlap) then Quiet's remaining 30 s.
+        self.assertAlmostEqual(report.duration_ms, 50_000, delta=200)
+        self.assertAlmostEqual(len(mix) / self.RATE, 50.0, delta=0.3)
+
+    def test_loudness_matching_is_actually_applied(self):
+        """The guard for the bug: trims computed but never used."""
+        _, report = self.render()
+        self.assertEqual(len(report.loudness_trims), 2)
+        self.assertTrue(any(abs(v) > 1.0 for v in report.loudness_trims.values()))
+
+    def test_matching_brings_the_two_tracks_closer_together(self):
+        plain, _ = self.render(match_loudness=False)
+        matched, _ = self.render()
+        # Measure a solo second of each track, before and after.
+        def solo(mix, at):
+            return render.measure_loudness(mix[int(at * self.RATE):int((at + 3) * self.RATE)],
+                                           self.RATE)
+        gap_plain = abs(solo(plain, 5) - solo(plain, 40))
+        gap_matched = abs(solo(matched, 5) - solo(matched, 40))
+        self.assertLess(gap_matched, gap_plain)
+        self.assertLess(gap_matched, 3.0)
+
+    def test_it_does_not_clip(self):
+        mix, _ = self.render()
+        mix, _ = render.normalize(mix)
+        self.assertLessEqual(float(np.abs(mix).max()), 0.9701)
+
+    def test_the_overlap_carries_both_tracks(self):
+        mix, _ = self.render(match_loudness=False)
+        # Overlap sits at 20-24 s; both tracks sound there, so it is louder
+        # than the stretch just after, where only the incoming one plays.
+        during = float(np.abs(mix[int(21 * self.RATE):int(23 * self.RATE)]).mean())
+        after = float(np.abs(mix[int(26 * self.RATE):int(28 * self.RATE)]).mean())
+        self.assertGreater(during, after)
+
+
+class FilterSweepReportTest(unittest.TestCase):
+    """apply_filter_sweep has to say whether it actually did anything.
+
+    It used to return the chunk unchanged when neutral and leave the caller to
+    notice with `is not`, which never worked - `body[-n:]` builds a fresh slice
+    object each time it is evaluated, so the check was always true and a run
+    reported a filter sweep on all 26 transitions when only 16 had one set.
+    """
+    N = 4096
+
+    def chunk(self):
+        return np.zeros((self.N, 2), dtype=np.float32)
+
+    def test_no_filter_set_returns_none(self):
+        self.assertIsNone(render.apply_filter_sweep(np, self.chunk(), None, {}, "out"))
+
+    def test_an_off_filter_returns_none(self):
+        ing = {"filter": {"raw": "None", "value": None, "off": True}}
+        self.assertIsNone(render.apply_filter_sweep(np, self.chunk(), None, ing, "out"))
+
+    def test_a_named_sweep_returns_audio(self):
+        ing = {"filter": {"raw": "High-pass filter out", "value": "high pass filter out",
+                          "off": False}}
+        out = render.apply_filter_sweep(np, self.chunk(), None, ing, "out")
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out), self.N)
+
+    def test_a_sweep_named_for_the_other_side_is_not_applied(self):
+        ing = {"filter": {"raw": "High-pass filter in", "value": "high pass filter in",
+                          "off": False}}
+        self.assertIsNone(render.apply_filter_sweep(np, self.chunk(), None, ing, "out"))
+        self.assertIsNotNone(render.apply_filter_sweep(np, self.chunk(), None, ing, "in"))
+
+    def test_too_short_to_filter(self):
+        tiny = np.zeros((8, 2), dtype=np.float32)
+        ing = {"filter": {"value": "high pass filter out", "off": False}}
+        self.assertIsNone(render.apply_filter_sweep(np, tiny, None, ing, "out"))
