@@ -53,6 +53,26 @@ UNITY = 0.5
 
 BANDS = ("low", "mid", "high")
 
+#: Every curve family Spotify reports per side, beyond volume and the EQ bands.
+#: Names are the metadata suffix; all use the same segment format.
+#:
+#: filter_cutoff / filter_resonance
+#:     The Filter ingredient, as a real sweep rather than band gains. 0.5 is
+#:     the neutral position for both.
+#: reverb_*
+#:     The Effects ingredient's reverb, fully parameterised. decay_time is in
+#:     milliseconds; the rest are 0..1. dry_wet is the one that moves - the
+#:     others are usually held flat for the whole overlap.
+#: roll_time
+#:     The Looping ingredient: a beat-repeat on the outgoing side, the loop
+#:     length in milliseconds.
+EXTRA_CURVES = (
+    "filter_cutoff", "filter_resonance",
+    "reverb_brightness", "reverb_damping", "reverb_decay_time",
+    "reverb_dry_wet", "reverb_room_size", "reverb_send_level",
+    "roll_time",
+)
+
 
 @dataclass
 class Segment:
@@ -123,12 +143,33 @@ class Side:
     """One half of a transition: what happens to this track over the overlap."""
     volume: list[Segment] = field(default_factory=list)
     eq: dict[str, list[Segment]] = field(default_factory=dict)
+    #: the other curve families, by EXTRA_CURVES name; absent when unused
+    extra: dict[str, list[Segment]] = field(default_factory=dict)
     start_time_ms: int | None = None
     duration_ms: int | None = None
 
     def sample(self, pos: float) -> dict[str, float | None]:
         return {"volume": value_at(self.volume, pos),
-                **{b: value_at(self.eq.get(b, []), pos) for b in BANDS}}
+                **{b: value_at(self.eq.get(b, []), pos) for b in BANDS},
+                **{k: value_at(v, pos) for k, v in self.extra.items()}}
+
+    def has(self, name: str) -> bool:
+        """True when this side actually automates ``name``."""
+        return bool(self.extra.get(name))
+
+    def is_moving(self, name: str, eps: float = 1e-6) -> bool:
+        """True when a curve actually changes across the overlap.
+
+        Most of the reverb parameters are reported as a flat line - they are
+        settings, not automation - so this separates the ones being ridden
+        (dry_wet, typically) from the ones merely declared.
+        """
+        segs = self.extra.get(name)
+        if not segs:
+            return False
+        vals = [value_at(segs, p / 20.0) for p in range(21)]
+        vals = [v for v in vals if v is not None]
+        return bool(vals) and (max(vals) - min(vals)) > eps
 
 
 @dataclass
@@ -166,18 +207,22 @@ def _int(v) -> int | None:
 
 def parse_automation(prev_md: dict, cur_md: dict) -> Automation:
     """Build an :class:`Automation` from the two tracks' cluster metadata."""
-    out = Side(
-        volume=parse_curve(prev_md.get("audio.fade_out_curves")),
-        eq={b: parse_curve(prev_md.get(f"audio.fade_out_eq_{b}_gain_curves")) for b in BANDS},
-        start_time_ms=_int(prev_md.get("audio.fade_out_start_time")),
-        duration_ms=_int(prev_md.get("audio.fade_out_duration")),
-    )
-    inc = Side(
-        volume=parse_curve(cur_md.get("audio.fade_in_curves")),
-        eq={b: parse_curve(cur_md.get(f"audio.fade_in_eq_{b}_gain_curves")) for b in BANDS},
-        start_time_ms=_int(cur_md.get("audio.fade_in_start_time")),
-        duration_ms=_int(cur_md.get("audio.fade_in_duration")),
-    )
+    def side(md: dict, way: str) -> Side:
+        extra = {}
+        for name in EXTRA_CURVES:
+            segs = parse_curve(md.get(f"audio.fade_{way}_{name}_curves"))
+            if segs:
+                extra[name] = segs
+        return Side(
+            volume=parse_curve(md.get(f"audio.fade_{way}_curves")),
+            eq={b: parse_curve(md.get(f"audio.fade_{way}_eq_{b}_gain_curves")) for b in BANDS},
+            extra=extra,
+            start_time_ms=_int(md.get(f"audio.fade_{way}_start_time")),
+            duration_ms=_int(md.get(f"audio.fade_{way}_duration")),
+        )
+
+    out = side(prev_md, "out")
+    inc = side(cur_md, "in")
     return Automation(
         overlap_ms=_int(cur_md.get("audio.fade_overlap")),
         outgoing=out, incoming=inc, mode=cur_md.get("automix.mode"),
@@ -245,13 +290,17 @@ def describe(a: Automation) -> list[str]:
 
 def to_dict(a: Automation) -> dict:
     """Serializable form, including a sampled version of each curve."""
+    def segs(v):
+        return [{"start": g.start, "end": g.end, "points": g.points} for g in v]
+
     def side(s: Side) -> dict:
         return {
             "start_time_ms": s.start_time_ms,
             "duration_ms": s.duration_ms,
-            "volume": [{"start": g.start, "end": g.end, "points": g.points} for g in s.volume],
-            "eq": {b: [{"start": g.start, "end": g.end, "points": g.points}
-                       for g in s.eq.get(b, [])] for b in BANDS},
+            "volume": segs(s.volume),
+            "eq": {b: segs(s.eq.get(b, [])) for b in BANDS},
+            "extra": {k: segs(v) for k, v in s.extra.items()},
+            "moving": sorted(k for k in s.extra if s.is_moving(k)),
         }
     return {
         "overlap_ms": a.overlap_ms,
@@ -263,3 +312,35 @@ def to_dict(a: Automation) -> dict:
         "outgoing": side(a.outgoing),
         "incoming": side(a.incoming),
     }
+
+
+def _segs_from(raw) -> list[Segment]:
+    return [Segment(start=float(d["start"]), end=float(d["end"]),
+                    points=[(float(x), float(y)) for x, y in d["points"]])
+            for d in (raw or [])]
+
+
+def automation_from_dict(d: dict | None) -> Automation | None:
+    """Rebuild an :class:`Automation` from :func:`to_dict` output.
+
+    Needed because the curves are written into transitions.json by Phase 2 and
+    read back by the later phases, which must not have to re-parse the capture.
+    """
+    if not d:
+        return None
+
+    def side(raw: dict | None) -> Side:
+        raw = raw or {}
+        return Side(
+            volume=_segs_from(raw.get("volume")),
+            eq={b: _segs_from((raw.get("eq") or {}).get(b)) for b in BANDS},
+            extra={k: _segs_from(v) for k, v in (raw.get("extra") or {}).items()},
+            start_time_ms=raw.get("start_time_ms"),
+            duration_ms=raw.get("duration_ms"),
+        )
+
+    return Automation(
+        overlap_ms=d.get("overlap_ms"), mode=d.get("mode"),
+        from_uri=d.get("from_uri"), to_uri=d.get("to_uri"),
+        outgoing=side(d.get("outgoing")), incoming=side(d.get("incoming")),
+    )

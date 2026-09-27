@@ -141,12 +141,12 @@ class BpmLabelTest(unittest.TestCase):
 
     def test_loop_length_needs_the_bpm(self):
         """Why the BPM matters downstream, not just cosmetically."""
-        t = Transition(index=0, snapshot="", from_track=Track(title="A"),
+        t = Transition(index=0, snapshot="", from_track=Track(title="A", bpm=170),
                        to_track=Track(title="B", bpm=170), overlap_ms=2824,
                        ingredients={"loop": {"raw": "8 beat loop", "value": "8 beat loop",
                                              "off": False, "beats": 8}})
         self.assertEqual(t.loop_length_ms(), 2824)
-        t.to_track.bpm = None
+        t.from_track.bpm = None
         self.assertIsNone(t.loop_length_ms())
 
 

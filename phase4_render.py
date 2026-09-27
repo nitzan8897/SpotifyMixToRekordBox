@@ -176,6 +176,10 @@ def main() -> int:
     if peak > 0.97:
         log.info("Peak was %.2f before normalising, so the mix was turned down to fit.", peak)
 
+    if report.loops_applied:
+        log.info("Looping applied on %d transition(s): %s",
+                 len(report.loops_applied), ", ".join(report.loops_applied))
+
     if report.effects_skipped:
         log.warning("%d transition(s) use an Effects setting, which is not rendered. They blend "
                     "correctly but without the tail: %s",

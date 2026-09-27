@@ -155,6 +155,22 @@ def main() -> int:
     if report.get("order_source"):
         log.info("Running order taken from %s.", report["order_source"])
 
+    with_curves = report.get("transitions_with_player_curves") or 0
+    captured = report.get("player_curve_pairs_captured") or 0
+    if with_curves:
+        log.info("The player's own automation curves were captured for %d of %d transition(s). "
+                 "Those render exactly; the rest are rebuilt from the named settings.",
+                 with_curves, report["transitions"])
+    elif captured:
+        log.warning("Automation curves were captured for %d transition(s), but none of them "
+                    "belong to this playlist - something else was playing. To capture this "
+                    "playlist's curves, play it: python phase1_discover.py --play", captured)
+    else:
+        log.warning("No automation curves in this run, so every transition is rebuilt from its "
+                    "named setting rather than reproduced exactly. Spotify only reports the "
+                    "curves while a mixed playlist is PLAYING (previewing in the editor does "
+                    "not do it): python phase1_discover.py --play")
+
     for d in report.get("dropped_not_on_chain", []):
         log.warning("DROPPED %s: %s -> %s (out %s ms) - not part of the mix's running "
                     "order. The editor keeps showing the last transition it rendered, so a "

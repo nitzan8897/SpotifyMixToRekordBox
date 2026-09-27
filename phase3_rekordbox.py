@@ -38,6 +38,7 @@ from src.config import ConfigError, load_config
 from src.logs import setup_logging
 from src.rekordbox import (MISSING_DIR, build_entries, build_xml, playlist_order,
                            scan_music_dirs)
+from src.automix import automation_from_dict
 from src.transitions import ExtractError, Track, Transition
 
 log = logging.getLogger("src.rekordbox.cli")
@@ -66,6 +67,9 @@ def load_transitions(path: Path) -> list[Transition]:
             # Carries the Loop ingredient's beat count, which sets the loop
             # length written for this transition.
             ingredients=row.get("ingredients") or {},
+            # The player's own curves, when the capture caught them. The
+            # renderer prefers these over the ingredient names.
+            automation=automation_from_dict(row.get("automation")),
         ))
     if not out:
         raise ExtractError(f"{path} contains no transitions. Re-run phase2_extract.py.")

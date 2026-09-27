@@ -360,3 +360,77 @@ class SplitTest(unittest.TestCase):
         for bad in '<>:"/|?*' + chr(92):
             self.assertNotIn(bad, name)
         self.assertTrue(name.endswith(".wav"))
+
+
+class RollTest(unittest.TestCase):
+    """The Looping ingredient: a beat repeat on the outgoing track."""
+
+    def signal(self, seconds=6.0, rate=44100):
+        t = np.arange(int(seconds * rate)) / rate
+        mono = (np.sin(2 * np.pi * 220 * t) * np.exp(-(t % 1.0) * 4)).astype(np.float32)
+        return mono[:, None] * np.ones((1, 2), np.float32)
+
+    def test_the_period_is_exactly_the_loop_length(self):
+        """An earlier version shortened the loop to hide the wrap, which made
+        every repeat land early and walked the roll off the beat."""
+        rate = 44100
+        out = apply = render.apply_roll(np, self.signal(rate=rate), 1000, rate)
+        first, second, third = out[:rate], out[rate:2 * rate], out[2 * rate:3 * rate]
+        self.assertTrue(np.allclose(first, second, atol=1e-6))
+        self.assertTrue(np.allclose(first, third, atol=1e-6))
+
+    def test_it_repeats_rather_than_playing_on(self):
+        rate = 44100
+        src = self.signal(rate=rate)
+        out = render.apply_roll(np, src, 500, rate)
+        # The second half-second now matches the first, where the source did not.
+        half = rate // 2
+        self.assertTrue(np.allclose(out[:half], out[half:2 * half], atol=1e-6))
+        self.assertFalse(np.allclose(src[:half], src[half:2 * half], atol=1e-3))
+
+    def test_the_wrap_does_not_step(self):
+        rate = 44100
+        out = render.apply_roll(np, self.signal(rate=rate), 1000, rate)
+        step = float(np.abs(out[rate] - out[rate - 1]).max())
+        self.assertLess(step, 0.05)
+
+    def test_a_loop_longer_than_the_region_is_left_alone(self):
+        src = self.signal(seconds=1.0)
+        self.assertIs(render.apply_roll(np, src, 5000, 44100), src)
+
+    def test_length_is_unchanged(self):
+        src = self.signal(seconds=3.0)
+        self.assertEqual(len(render.apply_roll(np, src, 700, 44100)), len(src))
+
+
+class RollLengthTest(unittest.TestCase):
+    """How long the roll is, and which track's tempo sets it."""
+
+    def transition(self, beats=2, from_bpm=65, to_bpm=130):
+        return Transition(
+            index=0, snapshot="", from_track=Track(title="A", bpm=from_bpm),
+            to_track=Track(title="B", bpm=to_bpm), overlap_ms=7384,
+            ingredients={"loop": {"raw": f"{beats}-beat loop", "value": f"{beats} beat loop",
+                                  "off": False, "beats": beats}})
+
+    def test_it_uses_the_outgoing_tempo(self):
+        """The player reports this as fade_out_roll_time, so the roll is on the
+        track that is leaving and must be measured in that track's tempo."""
+        t = self.transition()
+        self.assertEqual(render.roll_ms_from(None, t), 1846)     # 2 beats at 65
+        self.assertNotEqual(render.roll_ms_from(None, t), 923)   # not 2 at 130
+
+    def test_four_repeats_fill_that_overlap_exactly(self):
+        """The check that settles which tempo: 1846 x 4 is the 7384 ms overlap."""
+        t = self.transition()
+        self.assertEqual(render.roll_ms_from(None, t) * 4, t.overlap_ms)
+
+    def test_no_loop_setting_means_no_roll(self):
+        t = self.transition()
+        t.ingredients = {}
+        self.assertIsNone(render.roll_ms_from(None, t))
+
+    def test_beats_to_ms(self):
+        self.assertEqual(render.loop_ms_from_beats(8, 170), 2824)
+        self.assertIsNone(render.loop_ms_from_beats(None, 170))
+        self.assertIsNone(render.loop_ms_from_beats(2, None))

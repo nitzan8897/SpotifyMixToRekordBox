@@ -105,6 +105,9 @@ class IngredientsTest(unittest.TestCase):
     def test_loop_length_from_beats_and_bpm(self):
         # 8 beats at 170 BPM is the 2824 ms overlap the editor showed.
         self.assertEqual(ingredients.loop_ms(8, 170), 2824)
+        # 2 beats of a 65 BPM track is 1846 ms, four of which fill that
+        # transition's 7384 ms overlap exactly.
+        self.assertEqual(ingredients.loop_ms(2, 65), 1846)
         self.assertEqual(ingredients.loop_ms(2, 118), 1017)
         self.assertIsNone(ingredients.loop_ms(None, 170))
         self.assertIsNone(ingredients.loop_ms(8, None))

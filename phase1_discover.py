@@ -67,8 +67,10 @@ TEXT_TYPES = ("json", "text/", "javascript", "xml", "protobuf", "x-protobuf", "g
 
 COMMANDS_HELP = """
   Commands (type then Enter):
-    a        walk EVERY transition automatically: open each, preview it so the
-             player reports its curves, snapshot it. Open the mix editor first.
+    a        walk EVERY transition automatically: open each, snapshot its
+             settings. Open the playlist's Mix view first.
+    w        play the playlist and skip along it, to capture Spotify's real
+             automation curves (the only way to get them)
     s        snapshot the DOM now (do this with the transition editor OPEN,
              once per transition you inspect)
     c        list buttons that might open a mix/transition editor
@@ -420,6 +422,9 @@ async def run(cfg, run_dir: Path, args) -> int:
         print(COMMANDS_HELP)
         snap_n = 0
 
+        if args.play:
+            await play_through(page, run_dir, patterns, args.play_dwell_ms)
+
         if args.auto:
             captured = await auto_walk(page, run_dir, patterns, args.preview_ms)
             if captured:
@@ -435,6 +440,8 @@ async def run(cfg, run_dir: Path, args) -> int:
                 break
             if cmd == "a":
                 await auto_walk(page, run_dir, patterns, args.preview_ms)
+            elif cmd == "w":
+                await play_through(page, run_dir, patterns, args.play_dwell_ms)
             elif cmd in ("s", ""):
                 snap_n += 1
                 await snapshot_dom(page, run_dir, f"snapshot_{snap_n:02d}", patterns)
@@ -486,8 +493,13 @@ async def run(cfg, run_dir: Path, args) -> int:
 TRANSITION_CHIP = ('button[data-encore-id="chip"][role="checkbox"][aria-pressed]')
 #: The panel that only exists while a transition is open in the editor.
 INGREDIENT_PANEL = "[data-curve-editing-ingredient-controls]"
-#: Labels of the per-strip preview button, by UI language.
-PREVIEW_LABELS = ("play transition", "play the transition", "ניגון המעבר")
+#: The per-transition preview button. A data-testid, so it does not depend on
+#: the UI language the way the aria-label does.
+PREVIEW_BUTTON = '[data-testid="transition-preview-button"]'
+#: Driving playback: the playlist's play button and the player's skip control.
+PLAY_BUTTON = '[data-testid="play-button"]'
+SKIP_FORWARD = '[data-testid="control-button-skip-forward"]'
+PLAYPAUSE = '[data-testid="control-button-playpause"]' 
 
 
 async def _chip_is_open(chip) -> bool:
@@ -572,20 +584,63 @@ async def auto_walk(page, run_dir: Path, patterns: dict, preview_ms: int) -> int
 
 
 async def _preview_transition(page, chip, preview_ms: int) -> None:
-    """Play the transition this chip belongs to, so its curves are reported."""
-    # The preview button is a sibling of the chip inside the same strip.
-    strip = chip.locator("xpath=ancestor::*[.//button[@aria-label]][1]")
-    for text in PREVIEW_LABELS:
-        for scope in (strip, page):
-            button = scope.locator(f'button[aria-label="{text}"]')
-            try:
-                if await button.count():
-                    await button.first.click(timeout=4000)
-                    await page.wait_for_timeout(preview_ms)
-                    return
-            except Exception as e:
-                log.debug("Preview click failed for %r: %s", text, e)
-    log.debug("No preview button found for this transition; its curves stay uncaptured.")
+    """Play the transition this chip belongs to."""
+    strip = chip.locator("xpath=ancestor::*[.//button][1]")
+    for scope in (strip, page):
+        button = scope.locator(PREVIEW_BUTTON)
+        try:
+            if await button.count():
+                await button.first.click(timeout=4000)
+                await page.wait_for_timeout(preview_ms)
+                return
+        except Exception as e:
+            log.debug("Preview click failed: %s", e)
+    log.debug("No preview button found for this transition.")
+
+
+async def play_through(page, run_dir: Path, patterns: dict, dwell_ms: int,
+                       tracks: int | None = None) -> None:
+    """Play the playlist and skip along it, to capture the automation curves.
+
+    This is the only way to get Spotify's real curves. The player reports them
+    as track metadata on ``connect-state/v1/cluster``, and it only does so for
+    a playlist that is *playing* - opening or previewing a transition in the
+    editor does not update that state.
+
+    The payoff is large: one response carries the fade metadata for the whole
+    queue, around twenty tracks at a time, not just the track on air. So this
+    does not have to sit through the set. It starts playback and then skips
+    forward, which slides the queue window and makes the player re-report,
+    until every transition has been inside a window.
+
+    Nothing here writes: play and skip only.
+    """
+    try:
+        await page.locator(PLAY_BUTTON).first.click(timeout=8000)
+    except Exception as e:
+        log.error("Could not press play (%s). Start the playlist yourself, then use 'w'.", e)
+        return
+    log.info("Playing. Letting the player report its state...")
+    await page.wait_for_timeout(max(dwell_ms, 4000))
+    await snapshot_dom(page, run_dir, "playing_00", patterns)
+
+    n = tracks or 30
+    for i in range(n):
+        try:
+            await page.locator(SKIP_FORWARD).first.click(timeout=5000)
+        except Exception as e:
+            log.warning("Skip %d failed (%s); stopping the walk.", i + 1, e)
+            break
+        await page.wait_for_timeout(dwell_ms)
+        log.info("  skipped to track %d/%d", i + 2, n + 1)
+
+    # Leave the player paused rather than blaring after the run.
+    try:
+        await page.locator(PLAYPAUSE).first.click(timeout=4000)
+    except Exception:
+        pass
+    await snapshot_dom(page, run_dir, "playing_end", patterns)
+    log.info("Play-through done. Phase 2 will report how many transitions got real curves.")
 
 
 def _print_candidates(candidates: list[dict]) -> None:
@@ -638,6 +693,14 @@ def main() -> int:
                     help="walk every transition in the mix editor automatically: open each one, "
                          "preview it so the player reports its fade curves, and snapshot it. "
                          "No keyboard needed. Open the mix editor first, then run this.")
+    ap.add_argument("--play", action="store_true",
+                    help="play the playlist and skip along it, to capture Spotify's real "
+                         "automation curves. This is the only way to get them - the editor "
+                         "does not report them. Combine with --auto to get both the settings "
+                         "and the curves in one run.")
+    ap.add_argument("--play-dwell-ms", type=int, default=2500, metavar="MS",
+                    help="with --play, how long to sit on each track before skipping on "
+                         "(default 2500)")
     ap.add_argument("--preview-ms", type=int, default=4000, metavar="MS",
                     help="with --auto, how long to let each transition play so its curves are "
                          "captured (default 4000). 0 previews nothing and only reads the DOM.")

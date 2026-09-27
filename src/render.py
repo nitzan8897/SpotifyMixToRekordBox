@@ -69,6 +69,9 @@ class RenderError(Exception):
 # --------------------------------------------------------------------------
 # Audio plumbing
 # --------------------------------------------------------------------------
+from src.automix import BANDS, value_at
+
+
 def _np():
     try:
         import numpy as np
@@ -270,7 +273,6 @@ def apply_filter_setting(np, n: int, style: str | None, out_move: Move, in_move:
 
 def curves_from_capture(np, n: int, automation) -> tuple[Move, Move] | None:
     """Envelopes sampled from the player's own reported curves, if present."""
-    from src.automix import BANDS, value_at
 
     if not automation:
         return None
@@ -343,6 +345,7 @@ class RenderReport:
     segments: list = field(default_factory=list)
     duration_ms: int = 0
     effects_skipped: list = field(default_factory=list)
+    loops_applied: list = field(default_factory=list)
     wrong_edit: list = field(default_factory=list)
     missing: list = field(default_factory=list)
     peak: float = 0.0
@@ -484,6 +487,14 @@ def render(transitions: list, entry_for, rate: int = TARGET_RATE,
         if seg.overlap_ms and i + 1 < len(segments):
             n = min(ms(seg.overlap_ms), len(body))
             if n > 0:
+                trans = transitions[i]
+                # The Looping ingredient first: the roll replaces the audio
+                # under the blend, so it has to happen before the fades and
+                # EQ are applied on top of it.
+                roll = roll_ms_from(getattr(trans, "automation", None), trans)
+                if roll and roll < seg.overlap_ms:
+                    body[-n:] = apply_roll(np, body[-n:], roll, rate)
+                    report.loops_applied.append(f"{i + 1:02d} {roll} ms")
                 out_move, _ = moves_for(i, ms(seg.overlap_ms))
                 body[-n:] = apply_move(np, body[-n:], _truncate(out_move, n))
 
@@ -615,6 +626,10 @@ def render_solo(transitions: list, entry_for, rate: int = TARGET_RATE,
         if seg.overlap_ms and i + 1 < len(segments):
             n = min(ms(seg.overlap_ms), len(body))
             if n > 0:
+                trans = transitions[i]
+                roll = roll_ms_from(getattr(trans, "automation", None), trans)
+                if roll and roll < seg.overlap_ms:
+                    body[-n:] = apply_roll(np, body[-n:], roll, rate)
                 out_move, _ = moves_for(i, ms(seg.overlap_ms))
                 body[-n:] = apply_move(np, body[-n:], _truncate(out_move, n))
 
@@ -667,3 +682,67 @@ def write_pieces(mix, pieces: list[Piece], out_dir: Path, suffix: str = ".wav",
         sf.write(str(path), mix[a:b], rate)
         written.append(path)
     return written
+
+
+# --------------------------------------------------------------------------
+# The Looping ingredient
+# --------------------------------------------------------------------------
+def roll_ms_from(automation, transition, fallback_bpm: int | None = None) -> int | None:
+    """How long the transition's loop is, in milliseconds.
+
+    Two sources. The player reports ``audio.fade_out_roll_time_curves`` when it
+    has them, which is authoritative. Otherwise the editor's Looping setting
+    gives a beat count, and a beat count against the outgoing track's tempo is
+    the same number.
+    """
+    if automation is not None:
+        segs = automation.outgoing.extra.get("roll_time")
+        if segs:
+            v = value_at(segs, 0.0)
+            if v:
+                return int(round(v))
+    beats = transition.loop_beats() if hasattr(transition, "loop_beats") else None
+    bpm = fallback_bpm or getattr(getattr(transition, "from_track", None), "bpm", None)
+    return loop_ms_from_beats(beats, bpm)
+
+
+def loop_ms_from_beats(beats: int | None, bpm: int | None) -> int | None:
+    if not beats or not bpm:
+        return None
+    return int(round(beats * 60_000 / bpm))
+
+
+def apply_roll(np, chunk, roll_ms: int, rate: int = TARGET_RATE):
+    """Repeat the first ``roll_ms`` of ``chunk`` to fill it - a beat repeat.
+
+    This is what the Looping ingredient does to the outgoing track at a
+    transition: instead of playing on, the opening bar or beat of the blend is
+    caught and repeated underneath it. Spotify calls it a roll.
+
+    The period has to stay exactly ``roll_ms``. An earlier version smoothed the
+    wrap by shortening the loop, which made every repeat land a few
+    milliseconds earlier than the last and walked the roll off the beat.
+    Instead the loop is read a little long and its overhang is folded back over
+    its own start, which hides the seam while leaving the period untouched.
+    """
+    n = len(chunk)
+    period = int(round(roll_ms / 1000 * rate))
+    if period <= 0 or period >= n:
+        return chunk
+
+    blend = min(int(0.004 * rate), period // 8)      # about 4 ms
+    if blend > 1 and period + blend <= n:
+        loop = chunk[:period + blend].copy()
+        ramp = np.linspace(0.0, 1.0, blend, dtype=np.float32)[:, None]
+        # Fold what follows the loop over its opening, so the end of one
+        # repeat runs into the start of the next without a step.
+        loop[:blend] = loop[:blend] * ramp + loop[period:period + blend] * (1.0 - ramp)
+        loop = loop[:period]
+    else:
+        loop = chunk[:period].copy()
+
+    out = np.empty_like(chunk)
+    for start in range(0, n, period):
+        take = min(period, n - start)
+        out[start:start + take] = loop[:take]
+    return out

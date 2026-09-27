@@ -135,6 +135,10 @@ class Transition:
     ingredients: dict = field(default_factory=dict)
     #: "custom" or "automatic", from the chip above the incoming track
     mode: str | None = None
+    #: the player's own curves for this transition, when a capture caught
+    #: them. Set by extract(); the renderer prefers these over anything
+    #: rebuilt from the ingredient names.
+    automation: object | None = None
     #: position in the mix's running order, read straight off the page: the
     #: index of the chip whose editor was open. None when no chip was open,
     #: which means the snapshot caught a stale editor panel.
@@ -147,8 +151,18 @@ class Transition:
         return ((self.ingredients.get("loop") or {}).get("beats")) if self.ingredients else None
 
     def loop_length_ms(self) -> int | None:
-        """The loop ingredient's length on the incoming track, in ms."""
-        return loop_ms(self.loop_beats(), self.to_track.bpm)
+        """The Looping ingredient's length in ms, at the outgoing track's tempo.
+
+        The outgoing track's, not the incoming one's: the player reports this
+        as ``audio.fade_out_roll_time_curves``, so the loop is a beat repeat on
+        the track that is leaving. A repeat of that audio has to be measured in
+        that audio's tempo or it would not land on its beats.
+
+        It checks out against the overlap lengths too. Transition 10 of the
+        reference capture loops 2 beats of a 65 BPM track, 1846 ms, into a
+        7384 ms overlap - exactly four repeats.
+        """
+        return loop_ms(self.loop_beats(), self.from_track.bpm)
 
     def style(self) -> str:
         return ingredients_summary(self.ingredients) if self.ingredients else ""
@@ -157,6 +171,7 @@ class Transition:
         d = asdict(self)
         d["from_track"]["uri"] = self.from_track.uri
         d["to_track"]["uri"] = self.to_track.uri
+        d["automation"] = automation_to_dict(self.automation) if self.automation else None
         return d
 
 
@@ -372,6 +387,71 @@ def parse_snapshot(html_path: Path, index: int) -> Transition | None:
 # --------------------------------------------------------------------------
 # Whole-run extraction
 # --------------------------------------------------------------------------
+def _cluster_bodies(run_dir: Path):
+    """Every captured connect-state body, parsed."""
+    index = run_dir / "index.jsonl"
+    if not index.is_file():
+        return
+    for line in index.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if "connect-state" not in (row.get("endpoint") or "") or not row.get("body_file"):
+            continue
+        try:
+            yield json.loads((run_dir / row["body_file"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+
+
+def _uri_id(entry: dict) -> str | None:
+    uri = entry.get("uri") or entry.get("requested_uri") or ""
+    return uri.rsplit(":", 1)[-1] or None
+
+
+def harvest_automation(run_dir: Path) -> dict[tuple[str, str], dict]:
+    """The player's own curves for every transition any capture caught.
+
+    Keyed by ``(from_id, to_id)`` Spotify track ids.
+
+    The important thing about this endpoint: while a mixed playlist is
+    *playing*, the response carries fade metadata for the whole queue, not
+    just the track on air. One response covered 21 tracks in testing. So
+    playing the playlist is far more productive than previewing transitions
+    one at a time - and previewing in the editor does not appear to update
+    this state at all.
+
+    Each adjacent pair in the queue is one transition: the earlier track's
+    fade-out metadata and the later one's fade-in metadata describe the same
+    blend from its two sides.
+    """
+    found: dict[tuple[str, str], dict] = {}
+    for body in _cluster_bodies(run_dir):
+        state = body.get("player_state") or {}
+        queue = list(state.get("prev_tracks") or [])
+        if state.get("track"):
+            queue.append(state["track"])
+        queue += list(state.get("next_tracks") or [])
+
+        for earlier, later in zip(queue, queue[1:]):
+            a, b = _uri_id(earlier), _uri_id(later)
+            if not a or not b:
+                continue
+            out_md = earlier.get("metadata") or {}
+            in_md = later.get("metadata") or {}
+            # A pair is only usable when both halves are described.
+            if "audio.fade_out_start_time" not in out_md:
+                continue
+            if "audio.fade_in_start_time" not in in_md:
+                continue
+            auto = parse_automation(out_md, in_md)
+            auto.from_uri = f"spotify:track:{a}"
+            auto.to_uri = f"spotify:track:{b}"
+            found[(a, b)] = auto
+    return found
+
+
 def cluster_ground_truth(run_dir: Path) -> dict | None:
     """The fade values the player itself reported, if a cluster body was caught.
 
@@ -630,6 +710,17 @@ def extract(run_dir: Path) -> tuple[list[Transition], dict]:
         complete = bool(catalog) and tracks_on_chain == len(catalog)
         missing = None
 
+    # The player's own curves, where any capture caught them. Attached by
+    # track-id pair so the renderer can use the real automation instead of
+    # rebuilding it from the ingredient names.
+    harvested = harvest_automation(run_dir)
+    with_curves = 0
+    for t in transitions:
+        key = (t.from_track.spotify_id, t.to_track.spotify_id)
+        if all(key) and key in harvested:
+            t.automation = harvested[key]
+            with_curves += 1
+
     truth = cluster_ground_truth(run_dir)
     report = {
         "run": run_dir.name,
@@ -638,6 +729,8 @@ def extract(run_dir: Path) -> tuple[list[Transition], dict]:
         "transitions_parsed": len(parsed),
         "transitions": len(transitions),
         "order_source": order_source,
+        "transitions_with_player_curves": with_curves,
+        "player_curve_pairs_captured": len(harvested),
         "modes": {m: sum(1 for t in transitions if t.mode == m)
                   for m in sorted({t.mode for t in transitions if t.mode})},
         "dropped_not_on_chain": [

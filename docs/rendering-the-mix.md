@@ -70,7 +70,13 @@ and highs sit cut until that moment, matching what Spotify's own curves showed.
 Bass fade out and 3-band fade are ramps instead.
 
 **Filter.** High-pass and low-pass sweeps, in or out, on whichever side the
-setting names.
+setting names. Rebuilt as band gains; Spotify's own cutoff and resonance curves
+are captured but the renderer does not yet sweep a real filter from them.
+
+**Looping.** A beat repeat on the outgoing track, at that track's tempo, for
+the length the setting names. The player calls it a roll and reports it as
+`fade_out_roll_time`, which is what settles that it belongs to the track
+leaving rather than the one arriving.
 
 **Alignment.** Files that begin with silence Spotify's copy does not have are
 shifted so the blend lands on the music, the same correction the cue export
@@ -85,7 +91,10 @@ names, which is why the name tables matter.
 
 **The Effects slot.** Reverb and echo tails need a reverb and a delay line, and
 a bad imitation is worse than none. Transitions using one still blend
-correctly, just without the tail, and the run prints which ones.
+correctly, just without the tail, and the run prints which ones. The parameters
+*are* captured when the playlist has been played - reverb decay time, damping,
+room size, brightness, send level and dry/wet - so this is a gap in the
+renderer, not in the data.
 
 **Tempo matching.** No track is time-stretched. Spotify does not beat-match
 across large tempo jumps either, so the blends land where they land.

@@ -35,7 +35,7 @@ pip install -r requirements.txt
 # set playlist_url and paths.music_dir in config.yaml
 
 # open Spotify, open the playlist, open the Mix view, then:
-python phase1_discover.py --auto     # walks every transition by itself
+python phase1_discover.py --play --auto   # curves + settings in one pass
 python phase2_extract.py             # -> transitions.json, cue_sheet.md
 python phase0_download.py            # fetch the audio, then audit it
 
@@ -93,11 +93,12 @@ or `Automatic`. The chip's `aria-checked` marks which editor is open, so the
 capture knows when a click has actually landed, and the chip's position gives
 the running order straight from the page rather than inferred.
 
-**The network**, only while a transition preview is playing, in
-`connect-state/v1/cluster`: `audio.fade_in_start_time`,
-`audio.fade_out_start_time`, `audio.fade_overlap`, and the full volume and
-three-band EQ curves. Spotify attaches these only to the track playing and the
-one just played, never to upcoming tracks, so there is no bulk fetch.
+**The network**, while the playlist is *playing*, in `connect-state/v1/cluster`:
+the fade points plus the complete automation - volume, three-band EQ, filter
+cutoff and resonance, reverb with six parameters, and roll time for the loops.
+One response carries this for the whole queue, around twenty tracks at a time,
+so `--play` gets a whole playlist in one pass. The editor does not report it at
+all, previews included.
 
 That last source is what makes the first trustworthy. When a run catches a
 cluster response, Phase 2 cross-checks the DOM reading against the player's own

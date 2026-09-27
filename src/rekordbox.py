@@ -324,9 +324,12 @@ def build_entries(transitions: list, files: list[LocalFile],
         #    rekordbox can hold: it puts the DJ's hands on the right bars.
         beats = t.loop_beats()
         ingredient_loop = t.loop_length_ms()
-        if ingredient_loop and t.in_point_ms is not None:
-            start = t.in_point_ms / 1000.0
-            b.cues.append(Cue(f"{n:02d} loop {beats}b", start,
+        if ingredient_loop and t.out_point_ms is not None:
+            # On the outgoing track, at its out point: the player reports the
+            # loop as fade_out_roll_time, so it is a beat repeat on the track
+            # that is leaving, not an entry loop on the one arriving.
+            start = t.out_point_ms / 1000.0
+            a.cues.append(Cue(f"{n:02d} roll {beats}b", start,
                               loop_end=start + ingredient_loop / 1000.0))
         elif t.overlap_ms is not None and t.overlap_ms > 0:
             if t.out_point_ms is not None:
