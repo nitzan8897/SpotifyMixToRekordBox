@@ -524,15 +524,27 @@ def verify_against_cluster(transitions: list[Transition], truth: dict) -> dict:
 
 
 def dedupe(transitions: list[Transition]) -> list[Transition]:
-    """Keep the last snapshot of each distinct track pair.
+    """Keep the best snapshot of each distinct track pair.
 
-    Snapshotting the same transition twice is normal - the later one reflects
-    whatever the editor finally showed.
+    Snapshotting the same transition twice is normal - the later one usually
+    reflects whatever the editor finally showed, so later wins.
+
+    With one exception, which cost a whole transition before it was added. A
+    play-through snapshots the page repeatedly while the editor sits closed, so
+    those snapshots carry no chip position. If one of them happens to show the
+    same track pair as a real transition - and the last transition's pair is
+    exactly what the editor is left showing - then "later wins" replaces a
+    snapshot that knew its position with one that does not, and the transition
+    is then dropped for having no place in the running order. So a snapshot
+    that knows its position is never replaced by one that does not.
     """
     by_pair: dict[tuple, Transition] = {}
     for t in transitions:
         key = (normalize(t.from_track.title), normalize(t.to_track.title),
                t.from_track.bpm, t.to_track.bpm)
+        seen = by_pair.get(key)
+        if seen is not None and t.order_index is None and seen.order_index is not None:
+            continue
         by_pair[key] = t
     out = list(by_pair.values())
     for i, t in enumerate(out):

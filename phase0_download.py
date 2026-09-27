@@ -460,21 +460,28 @@ def main() -> int:
         print()
         print("   Every cue is an absolute offset into Spotify's timeline, so on these")
         print("   files the blends land on the wrong part of the music.")
-        if args.fix:
-            print()
-            print(f"Refetching {len(wrong)} track(s) with a duration-matched source...")
-            for t, _ in wrong:
-                print(f"   {describe(t)}")
-                refetch(t, music_dir)
-            print()
-            print("Done. Re-check with: python phase0_download.py --check-only")
-            print("Then re-render:      python phase4_render.py")
-        else:
-            print("   Fix them automatically with: python phase0_download.py --fix")
-            print(f"   (a content difference under {CONTENT_TOLERANCE_MS} ms is just "
-                  "padding and is fine)")
 
-    return 1 if (wrong or absent) else 0
+    # Both faults are the same job: the library is missing a usable recording of
+    # a track, whether because nothing downloaded or because what did is the
+    # wrong edit. Repairing only the wrong edits left two tracks with no audio
+    # at all, which stops the render outright rather than merely colouring it.
+    broken = [t for t, _ in wrong] + list(absent)
+    if broken and args.fix:
+        print()
+        print(f"Refetching {len(broken)} track(s) with a name- and length-matched source...")
+        for t in broken:
+            print(f"   {describe(t)}")
+            refetch(t, music_dir)
+        print()
+        print("Done. Re-check with: python phase0_download.py --check-only")
+        print("Then re-render:      python phase4_render.py")
+    elif broken:
+        print()
+        print("   Fix them automatically with: python phase0_download.py --fix")
+        print(f"   (a content difference under {CONTENT_TOLERANCE_MS} ms is just "
+              "padding and is fine)")
+
+    return 1 if broken else 0
 
 
 if __name__ == "__main__":

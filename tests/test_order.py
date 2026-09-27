@@ -127,3 +127,50 @@ class VerificationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DedupeKeepsPositionTest(unittest.TestCase):
+    """A snapshot that knows its place must not be replaced by one that does not.
+
+    From the real run: the play-through snapshots the page repeatedly with the
+    editor closed, so they carry no chip position. The editor is left showing
+    the last transition, so one of them matched that pair, "later wins"
+    replaced the good snapshot, and the transition was then dropped for having
+    no place in the running order.
+    """
+    @staticmethod
+    def at(pos, frm, to, snapshot):
+        t = mk(frm, to)
+        t.order_index = pos
+        t.snapshot = snapshot
+        return t
+
+    def test_a_positionless_later_snapshot_does_not_win(self):
+        real = self.at(25, "CORACAO", "Free Your Mind", "auto_26.html")
+        stray = self.at(None, "CORACAO", "Free Your Mind", "final.html")
+        out = dedupe([real, stray])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].snapshot, "auto_26.html")
+        self.assertEqual(out[0].order_index, 25)
+
+    def test_later_still_wins_between_two_positioned_snapshots(self):
+        first = self.at(3, "A", "B", "auto_04.html")
+        second = self.at(3, "A", "B", "auto_04b.html")
+        out = dedupe([first, second])
+        self.assertEqual([t.snapshot for t in out], ["auto_04b.html"])
+
+    def test_later_still_wins_when_neither_has_a_position(self):
+        first = self.at(None, "A", "B", "one.html")
+        second = self.at(None, "A", "B", "two.html")
+        out = dedupe([first, second])
+        self.assertEqual([t.snapshot for t in out], ["two.html"])
+
+    def test_the_last_transition_survives_a_play_through(self):
+        """End to end: 3 real transitions plus play-through noise on the last."""
+        given = [self.at(0, "A", "B", "a1"), self.at(1, "B", "C", "a2"),
+                 self.at(2, "C", "D", "a3"),
+                 self.at(None, "C", "D", "playing_00"),
+                 self.at(None, "C", "D", "final")]
+        chain, dropped = order_into_chain(dedupe(given))
+        self.assertEqual([t.from_track.title for t in chain], ["A", "B", "C"])
+        self.assertEqual(dropped, [])

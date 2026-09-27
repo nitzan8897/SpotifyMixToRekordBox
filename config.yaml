@@ -2,7 +2,7 @@
 # Paths are relative to this file unless absolute.
 
 # The Spotify playlist that holds your mixed transitions (must be one you own).
-playlist_url: "https://open.spotify.com/playlist/0jkL0VgonmSBWLS4PwONrx?si=8768fc5665ce4147"
+playlist_url: "https://open.spotify.com/playlist/5JhgdznacDbHSVy0IVCNKU?si=5393f8f0841749fc"
 
 paths:
   # Persistent browser profile. Your Spotify login lives here (cookies only;

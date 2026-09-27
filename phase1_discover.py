@@ -422,9 +422,10 @@ async def run(cfg, run_dir: Path, args) -> int:
         print(COMMANDS_HELP)
         snap_n = 0
 
-        if args.play:
-            await play_through(page, run_dir, patterns, args.play_dwell_ms)
-
+        # Order matters. The walk reads the editor, and --play reloads the
+        # client to force a state fetch, which closes the Mix view and takes
+        # the editor with it. So the settings are gathered first and the
+        # curves second; the other way round the walk found one transition.
         if args.auto:
             captured = await auto_walk(page, run_dir, patterns, args.preview_ms)
             if captured:
@@ -434,8 +435,19 @@ async def run(cfg, run_dir: Path, args) -> int:
                 log.warning("Auto-walk captured nothing. Open the mix editor on the playlist, "
                             "then use 'a' to retry or 's' to snapshot by hand.")
 
-        while True:
-            cmd = (await ainput("discover> ")).strip()
+        if args.play:
+            await play_through(page, run_dir, patterns, args.play_dwell_ms)
+
+        if args.exit_when_done and (args.play or args.auto):
+            log.info("Automated steps finished; writing the capture.")
+        while not (args.exit_when_done and (args.play or args.auto)):
+            try:
+                cmd = (await ainput("discover> ")).strip()
+            except EOFError:
+                # No console to read from: treat it as "done" rather than
+                # crashing out before the capture is written.
+                log.info("No input available; finishing the capture.")
+                break
             if cmd in ("q", "quit", "exit"):
                 break
             if cmd == "a":
@@ -493,13 +505,63 @@ async def run(cfg, run_dir: Path, args) -> int:
 TRANSITION_CHIP = ('button[data-encore-id="chip"][role="checkbox"][aria-pressed]')
 #: The panel that only exists while a transition is open in the editor.
 INGREDIENT_PANEL = "[data-curve-editing-ingredient-controls]"
+#: Toggles the playlist's Mix view, where the transition chips live. Without it
+#: open there are no chips to walk, so the walk opens it itself rather than
+#: making the mix view a precondition the caller has to remember.
+MIX_TOGGLE_LABELS = ("Mix", "מיקס")
+
 #: The per-transition preview button. A data-testid, so it does not depend on
 #: the UI language the way the aria-label does.
 PREVIEW_BUTTON = '[data-testid="transition-preview-button"]'
-#: Driving playback: the playlist's play button and the player's skip control.
+#: Driving playback. The playlist's own play button is the obvious route and
+#: the least reliable: it lives in the page header, so it is off screen as soon
+#: as the playlist has been scrolled, and clicking an invisible element times
+#: out. Hence the fallbacks.
 PLAY_BUTTON = '[data-testid="play-button"]'
+TRACK_ROW = '[data-testid="tracklist-row"]'
 SKIP_FORWARD = '[data-testid="control-button-skip-forward"]'
 PLAYPAUSE = '[data-testid="control-button-playpause"]' 
+
+
+async def settled_chip_count(page, tries: int = 12, gap_ms: int = 900) -> int:
+    """How many transition chips there are, once the list stops growing.
+
+    The playlist renders progressively, so an early count is short - 24 of 26
+    on one run. Taking that as final made the walk stop four transitions in,
+    reporting a playlist change that had not happened.
+    """
+    last, stable = -1, 0
+    for _ in range(tries):
+        try:
+            now = await page.locator(TRANSITION_CHIP).count()
+        except Exception:
+            now = last
+        if now == last and now > 0:
+            stable += 1
+            if stable >= 2:
+                return now
+        else:
+            stable = 0
+        last = now
+        await page.wait_for_timeout(gap_ms)
+    return max(last, 0)
+
+
+async def open_mix_view(page) -> bool:
+    """Turn on the playlist's Mix view. True if a chip appeared afterwards."""
+    for label in MIX_TOGGLE_LABELS:
+        button = page.locator(f'button[aria-label="{label}"]')
+        try:
+            if not await button.count():
+                continue
+            await button.first.click(timeout=5000)
+            await page.wait_for_timeout(2500)
+            if await page.locator(TRANSITION_CHIP).count():
+                log.info("Opened the Mix view.")
+                return True
+        except Exception as e:
+            log.debug("Mix toggle %r failed: %s", label, e)
+    return False
 
 
 async def _chip_is_open(chip) -> bool:
@@ -529,10 +591,14 @@ async def auto_walk(page, run_dir: Path, patterns: dict, preview_ms: int) -> int
     """
     chips = page.locator(TRANSITION_CHIP)
     try:
-        count = await chips.count()
+        count = await settled_chip_count(page)
     except Exception as e:
         log.error("Could not look for transition chips (%s).", e)
         return 0
+    if not count:
+        log.info("No transition chips on screen; trying to open the Mix view.")
+        if await open_mix_view(page):
+            count = await settled_chip_count(page)
     if not count:
         log.error("Found no transition chips (%s). Open the playlist's Mix view first - the "
                   "chips are the 'Custom'/'Automatic' labels between tracks. Then use 'a' to "
@@ -541,7 +607,35 @@ async def auto_walk(page, run_dir: Path, patterns: dict, preview_ms: int) -> int
 
     log.info("Found %d transition chip(s). Walking them automatically.", count)
     captured = 0
-    for i in range(count):
+    # A while loop, not range(count): the count can grow as the list renders,
+    # and a range fixed at the starting value silently skipped the chips that
+    # appeared later - the last two of twenty-six, on the run that found this.
+    i = -1
+    while True:
+        i += 1
+        if i >= count:
+            break
+        # If the number of chips changes, the page is no longer showing the
+        # playlist the walk started on - someone clicked something in Spotify,
+        # or it navigated itself. Carrying on records another playlist's
+        # transitions into this run, which is what happened once: two snapshots
+        # of a different mix, and the extract quietly dropped them as not being
+        # part of the running order.
+        try:
+            live = await chips.count()
+        except Exception:
+            live = count
+        if live > count:
+            # More chips have rendered than when this started. Harmless, and
+            # worth picking up rather than stopping short of them.
+            log.info("%d chips now render, up from %d; extending the walk.", live, count)
+            count = live
+        elif live < count:
+            log.error("The playlist changed mid-walk: %d chips now, %d before. Stopping "
+                      "after %d transition(s) rather than mixing two playlists into one "
+                      "capture. Leave Spotify alone during a capture and re-run.",
+                      live, count, captured)
+            break
         chip = chips.nth(i)
         try:
             await chip.scroll_into_view_if_needed(timeout=5000)
@@ -598,6 +692,79 @@ async def _preview_transition(page, chip, preview_ms: int) -> None:
     log.debug("No preview button found for this transition.")
 
 
+async def _reconnect(page, label: str, run_dir: Path, patterns: dict) -> None:
+    """Reload the client so it re-fetches its player state over HTTP."""
+    try:
+        await page.reload(wait_until="domcontentloaded")
+        await page.wait_for_timeout(6000)
+        await snapshot_dom(page, run_dir, label, patterns)
+    except Exception as e:
+        log.warning("Reload failed (%s); continuing without it.", e)
+
+
+async def _is_playing(page) -> bool:
+    """True when the player bar reports something on air."""
+    try:
+        state = await page.locator(PLAYPAUSE).first.get_attribute("aria-label")
+    except Exception:
+        return False
+    # The button's label names the action it will take, so "pause" means
+    # something is playing. Checked in both languages.
+    return bool(state) and ("pause" in state.lower() or "השהיה" in state)
+
+
+async def _start_playback(page) -> bool:
+    """Get the playlist playing, whatever is currently on screen.
+
+    Tries the playlist's own play button first, scrolling back to the top so it
+    is actually on screen - a scrolled playlist hides it in the header and the
+    click times out against an invisible element. Then a track row, then the
+    player bar.
+    """
+    try:
+        await page.keyboard.press("Home")
+        await page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+    buttons = page.locator(PLAY_BUTTON)
+    try:
+        for i in range(await buttons.count()):
+            one = buttons.nth(i)
+            if not await one.is_visible():
+                continue
+            await one.click(timeout=5000)
+            await page.wait_for_timeout(2000)
+            if await _is_playing(page):
+                return True
+    except Exception as e:
+        log.debug("Playlist play button failed: %s", e)
+
+    # Double-click the first track instead: the row's own play control only
+    # appears on hover, and a double click starts it without needing that.
+    try:
+        row = page.locator(TRACK_ROW).first
+        if await row.count():
+            await row.scroll_into_view_if_needed(timeout=4000)
+            await row.dblclick(timeout=5000)
+            await page.wait_for_timeout(2000)
+            if await _is_playing(page):
+                log.info("Started playback from the first track.")
+                return True
+    except Exception as e:
+        log.debug("Track row double-click failed: %s", e)
+
+    try:
+        await page.locator(PLAYPAUSE).first.click(timeout=4000)
+        await page.wait_for_timeout(2000)
+        if await _is_playing(page):
+            log.info("Resumed the player bar.")
+            return True
+    except Exception as e:
+        log.debug("Player bar failed: %s", e)
+    return False
+
+
 async def play_through(page, run_dir: Path, patterns: dict, dwell_ms: int,
                        tracks: int | None = None) -> None:
     """Play the playlist and skip along it, to capture the automation curves.
@@ -615,14 +782,20 @@ async def play_through(page, run_dir: Path, patterns: dict, dwell_ms: int,
 
     Nothing here writes: play and skip only.
     """
-    try:
-        await page.locator(PLAY_BUTTON).first.click(timeout=8000)
-    except Exception as e:
-        log.error("Could not press play (%s). Start the playlist yourself, then use 'w'.", e)
+    if not await _start_playback(page):
+        log.error("Could not start playback. Press play in Spotify yourself, then use 'w'.")
         return
     log.info("Playing. Letting the player report its state...")
     await page.wait_for_timeout(max(dwell_ms, 4000))
     await snapshot_dom(page, run_dir, "playing_00", patterns)
+
+    # The curves arrive in the reply to a connect-state fetch, and a client that
+    # is already connected does not make one - it takes its updates over the
+    # dealer socket instead, which carries none of this. A reload reconnects,
+    # and the fresh client asks for the full cluster: the queue as it stands,
+    # with the fade metadata for every track in it. Without this a play-through
+    # captures no curves at all, which is exactly what the first attempt did.
+    await _reconnect(page, "playing_after_reload", run_dir, patterns)
 
     n = tracks or 30
     for i in range(n):
@@ -633,6 +806,10 @@ async def play_through(page, run_dir: Path, patterns: dict, dwell_ms: int,
             break
         await page.wait_for_timeout(dwell_ms)
         log.info("  skipped to track %d/%d", i + 2, n + 1)
+        # One response only describes the queue around the current track, so
+        # reconnect every so often to catch the windows further along.
+        if (i + 1) % 8 == 0:
+            await _reconnect(page, f"playing_{i + 1:02d}", run_dir, patterns)
 
     # Leave the player paused rather than blaring after the run.
     try:
@@ -698,6 +875,9 @@ def main() -> int:
                          "automation curves. This is the only way to get them - the editor "
                          "does not report them. Combine with --auto to get both the settings "
                          "and the curves in one run.")
+    ap.add_argument("--exit-when-done", action="store_true",
+                    help="finish as soon as --play/--auto have run, instead of waiting at the "
+                         "prompt. Use it for an unattended capture.")
     ap.add_argument("--play-dwell-ms", type=int, default=2500, metavar="MS",
                     help="with --play, how long to sit on each track before skipping on "
                          "(default 2500)")
