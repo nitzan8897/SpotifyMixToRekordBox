@@ -69,6 +69,16 @@ class Alignment:
     reason: str = "not analysed"
 
     @property
+    def judged(self) -> bool:
+        """True when there was enough to form a verdict at all.
+
+        Without a decodable file or without Spotify's duration there is nothing
+        to compare, and "unknown" must not be reported as "different edit" -
+        that accusation sends someone off re-downloading a file that is fine.
+        """
+        return self.probe is not None and bool(self.spotify_ms)
+
+    @property
     def delta_ms(self) -> int | None:
         if self.probe is None or self.spotify_ms is None:
             return None

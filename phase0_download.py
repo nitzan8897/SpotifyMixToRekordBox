@@ -37,8 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from src.align import CONTENT_TOLERANCE_MS, align
@@ -113,22 +116,90 @@ def check_downloads(tracks: list[dict], music_dir: Path) -> list[tuple[dict, Pat
     return rows
 
 
-def find_source(track: dict, results: int = 12) -> tuple[str, int] | None:
-    """Search YouTube for the upload whose length best fits Spotify's.
+#: How many search results to weigh up.
+SEARCH_RESULTS = 20
+#: A length this far from Spotify's is a different edit outright, however well
+#: the title reads.
+LENGTH_REJECT_MS = 4000
+#: Words that mark a result as a rework rather than the track itself. A
+#: retitled edit is exactly what keeps arriving by mistake.
+REWORK = (
+    "slowed", "sped up", "speed up", "spedup", "nightcore", "reverb",
+    "remix", "edit", "mashup", "cover", "8d", "bass boosted", "bassboosted",
+    "tiktok", "ultra", "super", "extended", "loop", "1 hour", "1hour",
+    "instrumental", "acapella", "karaoke", "live", "lyrics", "gameplay",
+)
 
-    This is the step spotdl does not do. It picks the first plausible search
-    result, which regularly lands on a sped-up edit, a TikTok cut or - as
-    happened here - a version overlaid with game audio. Choosing by duration
-    instead gets the right recording most of the time, because a different
-    arrangement is a different length.
+
+def _rework_words(text: str) -> set[str]:
+    """Which rework markers a folded title contains, matched as whole words.
+
+    Whole words, not substrings: "Mc Oliver" contains "live", and penalising
+    that cost a correctly named track a quarter of its score.
+    """
+    words = text.split()
+    tokens = set(words)
+    found = set()
+    for marker in REWORK:
+        parts = marker.split()
+        if len(parts) == 1:
+            if marker in tokens:
+                found.add(marker)
+        elif any(words[i:i + len(parts)] == parts for i in range(len(words))):
+            found.add(marker)
+    return found
+
+
+def _title_score(track: dict, candidate: str) -> float:
+    """How well a result's title matches the track, 0..1.
+
+    Two parts, because either alone misleads. A fuzzy ratio against
+    "artist title" copes with reordering and punctuation. A token check then
+    insists the title's own words are actually present - "Ela Ke Leitada" and
+    "Ela Ke Cavucadinha" score deceptively well on ratio alone.
+
+    A rework word appearing in the result but not in the Spotify title counts
+    against it: that is what "slowed", "sped up" or a game overlay look like
+    from here.
+    """
+    want_title = fold(track.get("title"))
+    want_who = " ".join(fold(a) for a in (track.get("artists") or []))
+    got = fold(candidate)
+    if not want_title or not got:
+        return 0.0
+
+    ratio = SequenceMatcher(None, f"{want_who} {want_title}".strip(), got).ratio()
+    wanted = set(want_title.split())
+    present = len(wanted & set(got.split())) / len(wanted) if wanted else 0.0
+    artists = {w for a in (track.get("artists") or []) for w in fold(a).split()}
+    artist_hit = 0.15 if artists & set(got.split()) else 0.0
+
+    penalty = 0.25 * len(_rework_words(got) - _rework_words(want_title))
+    return max(0.0, 0.55 * present + 0.30 * ratio + artist_hit - penalty)
+
+
+def find_source(track: dict, results: int = SEARCH_RESULTS) -> tuple[str, int] | None:
+    """Search YouTube for the upload that is really this recording.
+
+    spotdl takes the first plausible result, which is how sped-up edits, TikTok
+    cuts and versions with game audio over the top keep arriving. This weighs
+    two things instead:
+
+    * **title** decides first. Results are grouped into title tiers, and a
+      clearly better title always beats a worse one. Ranking on a blend of the
+      two instead let a *different song* at a near-perfect length outrank the
+      right song two seconds off - exactly the failure this is meant to stop.
+    * **length** breaks ties within a tier, which is where it belongs: among
+      uploads of the same track, the one matching Spotify's duration is the
+      one whose arrangement matches. Anything more than a few seconds out is
+      rejected however good its title.
 
     Returns ``(youtube_url, duration_ms)`` or None.
     """
     try:
         import yt_dlp
     except ImportError:
-        log_print("   yt-dlp is not installed, so no search is possible "
-                  "(pip install yt-dlp).")
+        log_print("   yt-dlp is not installed (pip install yt-dlp)")
         return None
 
     target = track.get("duration_ms")
@@ -145,20 +216,34 @@ def find_source(track: dict, results: int = 12) -> tuple[str, int] | None:
         log_print(f"   search failed: {e}")
         return None
 
-    best = None
+    scored = []
     for e in info.get("entries") or []:
-        secs = e.get("duration")
-        if not secs:
+        secs, vid = e.get("duration"), e.get("id")
+        if not secs or not vid:
             continue
         ms = int(secs * 1000)
-        # Search durations come back rounded to the second, so this only has
-        # to get close; the download is measured properly afterwards.
         gap = abs(ms - target)
-        if best is None or gap < best[0]:
-            best = (gap, f"https://www.youtube.com/watch?v={e.get('id')}", ms)
-    if best is None:
+        if gap > LENGTH_REJECT_MS:
+            continue
+        title = _title_score(track, e.get("title") or "")
+        if title < 0.4:
+            continue
+        # Titles are bucketed so near-equal ones are treated as equal and the
+        # length decides between them, while a clearly better title still wins
+        # outright. Search durations are rounded to the second anyway, so
+        # "exact" means within a second or two; the download is measured
+        # properly afterwards.
+        scored.append((round(title, 1), gap, ms, vid, e.get("title") or "", title))
+
+    if not scored:
+        log_print(f"   nothing within {LENGTH_REJECT_MS} ms of Spotify's {target} ms "
+                  "with a matching title")
         return None
-    return best[1], best[2]
+    scored.sort(key=lambda r: (-r[0], r[1]))
+    best = scored[0]
+    log_print(f"   best of {len(scored)}: {best[4][:58]!r}")
+    log_print(f"      {best[2]} ms ({best[1]:+d} off Spotify), title {best[5]:.2f}")
+    return f"https://www.youtube.com/watch?v={best[3]}", best[2]
 
 
 def log_print(msg: str) -> None:
@@ -166,11 +251,18 @@ def log_print(msg: str) -> None:
 
 
 def refetch(track: dict, music_dir: Path) -> bool:
-    """Replace one track's audio with a duration-matched source.
+    """Replace one track's audio with a better-matched source.
 
-    The existing file is moved aside rather than deleted, and - importantly -
-    moved *outside* ``music_dir``, because the scanner recurses and would
-    otherwise match the discarded copy too.
+    Downloads into a temporary folder and only touches the existing file once
+    there is something to put in its place, and only if that something passes
+    the same check the audit uses. An earlier version moved the old file aside
+    and then downloaded, so a failed download left the track with no audio at
+    all - worse than a wrong file, because the render then refuses to run
+    instead of merely sounding off.
+
+    The replaced file is kept in a sibling folder *outside* ``music_dir``: the
+    scanner recurses, so a backup left inside would be picked up as a duplicate
+    of the track it replaced.
     """
     sid = track.get("spotify_id")
     if not sid:
@@ -178,24 +270,43 @@ def refetch(track: dict, music_dir: Path) -> bool:
         return False
     found = find_source(track)
     if not found:
-        log_print(f"   no candidate found for {describe(track)}")
         return False
-    url, ms = found
-    log_print(f"   source: {url}  ({ms} ms vs Spotify's {track.get('duration_ms')})")
+    url, _ = found
 
     from src.rekordbox import match_local_file, scan_music_dirs
-    existing, _ = match_local_file(track.get("title"), track.get("artists") or [],
-                                   scan_music_dirs([music_dir]), track.get("duration_ms"))
-    if existing:
-        attic = music_dir.parent / f"_{music_dir.name} replaced originals"
-        attic.mkdir(parents=True, exist_ok=True)
-        existing.replace(attic / existing.name)
-        log_print(f"   old file moved to {attic}")
 
-    cmd = [sys.executable, "-m", "spotdl", "download",
-           f"{url}|https://open.spotify.com/track/{sid}",
-           "--output", str(music_dir), "--format", FORMAT, "--bitrate", BITRATE]
-    return subprocess.run(cmd).returncode == 0
+    with tempfile.TemporaryDirectory(prefix="refetch-") as tmp:
+        staging = Path(tmp)
+        cmd = [sys.executable, "-m", "spotdl", "download",
+               f"{url}|https://open.spotify.com/track/{sid}",
+               "--output", str(staging), "--format", FORMAT, "--bitrate", BITRATE]
+        if subprocess.run(cmd).returncode != 0:
+            log_print("   download failed; the existing file was left alone")
+            return False
+        got = [q for q in staging.iterdir()
+               if q.is_file() and q.suffix.lower() in AUDIO_SUFFIXES]
+        if not got:
+            log_print("   download produced no audio; the existing file was left alone")
+            return False
+        fetched = max(got, key=lambda q: q.stat().st_size)
+
+        verdict = align(fetched, track.get("duration_ms"))
+        if verdict.judged and not verdict.same_recording:
+            log_print(f"   rejected: {verdict.reason}")
+            log_print("   the existing file was left alone")
+            return False
+
+        existing, _ = match_local_file(track.get("title"), track.get("artists") or [],
+                                       scan_music_dirs([music_dir]),
+                                       track.get("duration_ms"))
+        if existing:
+            attic = music_dir.parent / f"_{music_dir.name} replaced originals"
+            attic.mkdir(parents=True, exist_ok=True)
+            existing.replace(attic / existing.name)
+            log_print(f"   old file kept in {attic.name}")
+        shutil.copy2(fetched, music_dir / fetched.name)
+        log_print("   replaced")
+    return True
 
 
 def main() -> int:
@@ -272,10 +383,12 @@ def main() -> int:
 
     print("Checking each file against Spotify's duration...")
     rows = check_downloads(tracks, music_dir)
-    wrong, absent, fine = [], [], 0
+    wrong, absent, unjudged, fine = [], [], [], 0
     for t, path, a in rows:
         if path is None or a is None or a.probe is None:
             absent.append(t)
+        elif not a.judged:
+            unjudged.append((t, a))
         elif not a.same_recording:
             wrong.append((t, a))
         else:
@@ -286,11 +399,17 @@ def main() -> int:
         print(f"   {len(absent)} track(s) have no usable local file:")
         for t in absent:
             print(f"      {describe(t)}")
+    if unjudged:
+        print(f"   {len(unjudged)} file(s) could not be judged:")
+        for t, a in unjudged:
+            print(f"      {describe(t)}")
+            print(f"         {a.reason}")
     if wrong:
         wrong.sort(key=lambda r: -abs(r[1].delta_ms or 0))
         print(f"   {len(wrong)} file(s) are a DIFFERENT EDIT of the right song:")
         for t, a in wrong:
-            print(f"      {a.delta_ms:+7d} ms   {describe(t)}")
+            shown = "      ?" if a.delta_ms is None else f"{a.delta_ms:+7d}"
+            print(f"      {shown} ms   {describe(t)}")
             print(f"                   {a.reason}")
         print()
         print("   Every cue is an absolute offset into Spotify's timeline, so on these")
