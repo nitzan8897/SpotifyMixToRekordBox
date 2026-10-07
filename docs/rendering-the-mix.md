@@ -52,31 +52,56 @@ for listening.
 which for the run this was built against matched Spotify's own player to the
 millisecond.
 
-**Volume.** Each transition's Volume setting, as its actual shape:
+**Volume.** Each transition's Volume setting, as its actual shape. The shapes
+are the player's own, read off the transitions whose curves were captured:
 
 | Setting | What the render does |
 | --- | --- |
 | Overlap | Both tracks at full for the overlap, then the outgoing stops |
 | Crossfade | Linear fade down against linear fade up |
 | Smooth crossfade | Equal-power curve, so the middle does not dip |
-| Fade in fade out | Outgoing down as incoming comes up |
-| Fade in cut out | Incoming up at full, outgoing cut at the end |
+| Fade in fade out | Incoming up over the first half, outgoing down over the second |
+| Fade in cut out | Incoming up over the first half, outgoing cut at the end |
+| None | Incoming at full at once, outgoing down over the second half |
 | Unknown | A curve dragged off any preset; equal-power is used |
 
-**EQ.** The bass swaps are the important ones, and they are swaps, not fades:
-the outgoing low band is killed and the incoming one restored at the same
-instant, at the start, centre or end of the overlap as set. The incoming mids
-and highs sit cut until that moment, matching what Spotify's own curves showed.
-Bass fade out and 3-band fade are ramps instead.
+**EQ.** The bass swaps are swaps, not fades: the outgoing low band is killed
+and the incoming one restored at the same instant - in the first milliseconds,
+just before the midpoint, or in the last moments, as set. A swap that would
+land where the track holding the bass has already faded below half volume is
+brought forward to that point, so a blend never goes hollow. The 3-band fade
+steps every band, the highs at a quarter of the way and the rest at the
+midpoint. Bass fade out is a ramp.
 
-**Filter.** High-pass and low-pass sweeps, in or out, on whichever side the
-setting names. Rebuilt as band gains; Spotify's own cutoff and resonance curves
-are captured but the renderer does not yet sweep a real filter from them.
+**Filter.** A real resonant filter, swept from the player's cutoff and
+resonance curves when captured. Rebuilt from the name otherwise: an "out"
+sweep holds open for the first half and closes over the second, an "in" sweep
+starts closed and is open by the midpoint.
+
+**Effects.** The reverb is a convolution with a decaying-noise tail, set from
+the player's decay, damping, room size and brightness, or from its values for
+the one reverb it reported. Echo repeats at the named beat division. Either
+follows the player's dry/wet curve and keeps ringing for up to six seconds
+after the outgoing track is cut, which is what "cut end" means.
 
 **Looping.** A beat repeat on the outgoing track, at that track's tempo, for
-the length the setting names. The player calls it a roll and reports it as
-`fade_out_roll_time`, which is what settles that it belongs to the track
-leaving rather than the one arriving.
+the length the setting names. The loop is the beat or bar that *ends* at the
+out point: the moment just heard is held. The player calls it a roll and
+reports it as `fade_out_roll_time`, which is what settles that it belongs to
+the track leaving rather than the one arriving.
+
+**Tempo.** The player plays the incoming track at the outgoing one's tempo
+for the length of the blend; a captured transition reports the incoming side
+as lasting the overlap times the tempo ratio. The render does the same, with
+Rubber Band through ffmpeg, so the pitch stays put. Captured transitions use
+the player's own ratio; rebuilt ones match tempos up to 9 % apart and leave
+bigger jumps alone, as the player does. Without an ffmpeg that has Rubber
+Band, the speed changes instead and the pitch moves with it for the blend.
+
+**Level.** Every track is measured (ITU-R BS.1770) and brought to the set's
+median loudness, but no louder than -10 LUFS, which leaves room for two tracks
+playing at once. A look-ahead limiter then holds the peaks at -1 dBFS,
+turning down only the moments that need it. MP3 is written at 320 kbps.
 
 **Alignment.** Files that begin with silence Spotify's copy does not have are
 shifted so the blend lands on the music, the same correction the cue export
@@ -88,16 +113,6 @@ for transitions that were previewed during capture, so most runs rebuild from
 names, which is why the name tables matter.
 
 ## What it does not
-
-**The Effects slot.** Reverb and echo tails need a reverb and a delay line, and
-a bad imitation is worse than none. Transitions using one still blend
-correctly, just without the tail, and the run prints which ones. The parameters
-*are* captured when the playlist has been played - reverb decay time, damping,
-room size, brightness, send level and dry/wet - so this is a gap in the
-renderer, not in the data.
-
-**Tempo matching.** No track is time-stretched. Spotify does not beat-match
-across large tempo jumps either, so the blends land where they land.
 
 **Anything on a wrong-edit file.** If a download is a different recording of
 the right song, the out point is the wrong musical moment and the blend will

@@ -71,8 +71,8 @@ curves and no setting makes rekordbox replay a Spotify mix unattended. That is
 why Phase 4 exists: it applies the automation here and hands you finished
 audio, which sidesteps the format's limits entirely.
 
-Not reproduced in the render: the Effects slot, meaning reverb and echo tails.
-Those transitions still blend correctly, just without the tail.
+The render reproduces all five ingredients - reverb and echo tails included -
+and matches the incoming track's tempo across each blend, as the player does.
 
 ## Where the transition data actually lives
 

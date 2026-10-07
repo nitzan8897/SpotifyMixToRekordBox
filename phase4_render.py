@@ -17,14 +17,13 @@ timed by hand.
 
 What it reproduces
 ------------------
-Out points, in points and overlap lengths exactly as captured, plus the
-Volume, EQ and Filter moves of each transition. Where the capture caught the
-player's own automation curves those are used directly; otherwise the move is
-rebuilt from the named setting ("Centre bass swap" and so on), which the
-capture has for every transition.
-
-The Effects slot - reverb and echo tails - is not reproduced. Those transitions
-still blend correctly, just without the tail, and the run says which ones.
+Out points, in points and overlap lengths exactly as captured, plus all five
+ingredients of each transition: Volume, EQ, Filter, the reverb or echo of the
+Effects slot, and the loop. Where the capture caught the player's own
+automation curves those are used directly; otherwise the move is rebuilt from
+the named setting ("Centre bass swap" and so on), which the capture has for
+every transition. The incoming track is time-stretched to the outgoing one's
+tempo for the length of each blend, as the player does.
 """
 from __future__ import annotations
 
@@ -37,7 +36,7 @@ from pathlib import Path
 from src.config import ConfigError, load_config
 from src.logs import setup_logging
 from src.rekordbox import build_entries, scan_music_dirs, _track_key
-from src.render import (RenderError, normalize, plan, render, split_points, write,
+from src.render import (RenderError, limit, plan, render, split_points, write,
                         write_pieces, write_solo)
 from src.transitions import ExtractError
 
@@ -129,7 +128,7 @@ def main() -> int:
         log.error("%s", e)
         return 1
 
-    mix, peak = normalize(mix)
+    mix, peak = limit(mix)
 
     if args.separate:
         out_dir = (Path(args.output).resolve() if args.output
@@ -173,8 +172,12 @@ def main() -> int:
         log.info("Written: %s", out_path)
         log.info("Length:  %s", _hms(report.duration_ms))
 
-    if peak > 0.97:
-        log.info("Peak was %.2f before normalising, so the mix was turned down to fit.", peak)
+    if peak > 0.891:
+        log.info("Peak was %.2f; the limiter held it to -1 dBFS.", peak)
+
+    if report.tempo_matched:
+        log.info("Tempo matched across %d blend(s): %s",
+                 len(report.tempo_matched), ", ".join(report.tempo_matched))
 
     if report.loops_applied:
         log.info("Looping applied on %d transition(s): %s",
@@ -191,15 +194,8 @@ def main() -> int:
         log.info("Filter sweep on %d transition(s): %s",
                  len(report.filters_applied), ", ".join(report.filters_applied))
     if report.reverbs_applied:
-        log.info("Reverb tail on %d transition(s): %s",
+        log.info("Reverb or echo tail on %d transition(s): %s",
                  len(report.reverbs_applied), ", ".join(report.reverbs_applied))
-
-    still_missing = [e for e in report.effects_skipped
-                     if "echo" in e and e.split()[0] not in report.reverbs_applied]
-    if still_missing:
-        log.warning("%d transition(s) use an echo, which is not rendered. They blend "
-                    "correctly but without the tail: %s",
-                    len(still_missing), ", ".join(still_missing))
 
     if report.wrong_edit:
         log.warning("")

@@ -68,6 +68,21 @@ class VolumeEnvelopeTest(unittest.TestCase):
         self.assertAlmostEqual(float(inc[0]), 0.0)
         self.assertAlmostEqual(float(inc[-1]), 1.0)
 
+    def test_fades_take_half_the_overlap(self):
+        """The player's curves fade in over the first half and out over the
+        second; spreading both across the whole overlap sank the middle."""
+        out, inc = self.env("fade in fade out")
+        self.assertAlmostEqual(float(inc[self.N // 2]), 1.0, places=2)
+        self.assertAlmostEqual(float(out[self.N // 2 - 1]), 1.0, places=2)
+        self.assertAlmostEqual(float(out[-1]), 0.0)
+        self.assertAlmostEqual(float(inc[0]), 0.0)
+
+    def test_no_volume_setting_still_takes_the_outgoing_track_out(self):
+        out, inc = self.env(None)
+        self.assertTrue(np.allclose(inc, 1.0))
+        self.assertAlmostEqual(float(out[self.N // 4]), 1.0)
+        self.assertAlmostEqual(float(out[-1]), 0.0)
+
     def test_crossfade_is_linear_both_ways(self):
         out, inc = self.env("crossfade")
         self.assertAlmostEqual(float(out[0]), 1.0)
@@ -134,8 +149,31 @@ class EqEnvelopeTest(unittest.TestCase):
         cut = render.knob_to_gain(render.BAND_CUT)
         self.assertAlmostEqual(self.at(out, "mid", 0.25), 1.0)
         self.assertAlmostEqual(self.at(out, "mid", 0.75), cut)
-        self.assertAlmostEqual(self.at(inc, "high", 0.25), cut)
-        self.assertAlmostEqual(self.at(inc, "high", 0.75), 1.0)
+        # The highs change hands first, at a quarter of the way through.
+        self.assertAlmostEqual(self.at(inc, "high", 0.2), cut)
+        self.assertAlmostEqual(self.at(inc, "high", 0.3), 1.0)
+        self.assertAlmostEqual(self.at(out, "high", 0.3), cut)
+
+    def test_swaps_land_where_the_player_puts_them(self):
+        """Start in the first moments, centre just before half, end at the end."""
+        where = {}
+        for style in ("start bass swap", "centre bass swap", "end bass swap"):
+            _, inc = render.eq_envelopes(np, self.N, style)
+            where[style] = int(np.argmax(inc.low > 0.5)) / self.N
+        self.assertLess(where["start bass swap"], 0.01)
+        self.assertAlmostEqual(where["centre bass swap"], 0.49, delta=0.01)
+        self.assertGreater(where["end bass swap"], 0.97)
+
+    def test_a_swap_is_never_left_where_no_one_carries_the_bass(self):
+        """An end swap under a fade-out would leave seconds with no bass."""
+        out_vol, in_vol = render.volume_envelopes(np, self.N, "fade in fade out")
+        _, inc = render.eq_envelopes(np, self.N, "end bass swap", out_vol, in_vol)
+        swap = int(np.argmax(inc.low > 0.5))
+        self.assertGreaterEqual(float(out_vol[swap - 1]), 0.5)
+
+        _, inc = render.eq_envelopes(np, self.N, "start bass swap", out_vol, in_vol)
+        swap = int(np.argmax(inc.low > 0.5))
+        self.assertGreaterEqual(float(in_vol[swap]), 0.5)
 
     def test_bass_fade_out_is_a_ramp_not_a_step(self):
         out, _ = render.eq_envelopes(np, self.N, "bass fade out")
@@ -151,35 +189,96 @@ class EqEnvelopeTest(unittest.TestCase):
 
 
 class FilterTest(unittest.TestCase):
-    N = 500
+    """The Filter ingredient as a real moving filter."""
+    RATE = 44100
 
-    def moves(self):
-        return render.eq_envelopes(np, self.N, None)
+    def sine(self, hz, seconds=2.0):
+        t = np.arange(int(seconds * self.RATE)) / self.RATE
+        return (0.5 * np.sin(2 * np.pi * hz * t)).astype(np.float32)[:, None] * np.ones(
+            (1, 2), np.float32)
 
-    def test_high_pass_out_sweeps_the_low_end_away(self):
-        out, inc = self.moves()
-        render.apply_filter_setting(np, self.N, "high pass filter out", out, inc)
-        self.assertAlmostEqual(float(out.low[0]), 1.0)
-        self.assertAlmostEqual(float(out.low[-1]), 0.0)
+    def rms(self, x):
+        return float(np.sqrt(np.mean(x ** 2)))
 
-    def test_low_pass_in_sweeps_the_top_back_in(self):
-        out, inc = self.moves()
-        render.apply_filter_setting(np, self.N, "low pass filter in", out, inc)
-        self.assertAlmostEqual(float(inc.high[0]), 0.0)
-        self.assertAlmostEqual(float(inc.high[-1]), 1.0)
+    def flat(self, n, v):
+        return np.full(n, v, dtype=np.float32)
 
-    def test_a_combined_setting_touches_both_sides(self):
-        out, inc = self.moves()
-        render.apply_filter_setting(
-            np, self.N, "low pass filter in + high pass filter out", out, inc)
-        self.assertAlmostEqual(float(inc.high[0]), 0.0)
-        self.assertAlmostEqual(float(out.low[-1]), 0.0)
+    def test_a_held_filter_does_not_tremble(self):
+        """The bug: every 25 ms hop was windowed twice, a 40 Hz tremolo 12 dB
+        down. A tone well inside the passband must come through steady."""
+        x = self.sine(500)
+        n = len(x)
+        y = render.sweep_filter(np, x, self.flat(n, 0.3), self.flat(n, 0.5), False, self.RATE)
+        body = y[self.RATE // 2: -self.RATE // 2]
+        self.assertAlmostEqual(self.rms(body), self.rms(x), delta=0.05 * self.rms(x))
+        # Level measured in 20 ms windows barely moves.
+        w = int(0.02 * self.RATE)
+        levels = [self.rms(body[i:i + w]) for i in range(0, len(body) - w, w)]
+        self.assertLess(max(levels) / min(levels), 1.05)
 
-    def test_no_filter_changes_nothing(self):
-        out, inc = self.moves()
-        render.apply_filter_setting(np, self.N, None, out, inc)
+    def test_a_closed_low_pass_takes_the_top_away(self):
+        x = self.sine(6000)
+        n = len(x)
+        y = render.sweep_filter(np, x, self.flat(n, 0.0), self.flat(n, 0.5), False, self.RATE)
+        self.assertLess(self.rms(y[self.RATE:]), 0.01 * self.rms(x))
+
+    def test_an_open_high_pass_takes_the_bass_away(self):
+        x = self.sine(50)
+        n = len(x)
+        y = render.sweep_filter(np, x, self.flat(n, 0.9), self.flat(n, 0.5), True, self.RATE)
+        self.assertLess(self.rms(y[self.RATE:]), 0.05 * self.rms(x))
+
+    def test_neutral_stretches_are_left_untouched(self):
+        x = self.sine(300)
+        n = len(x)
+        cutoff = render._named_filter_curve(np, n, "low pass filter out", "out")
+        y = render.sweep_filter(np, x, cutoff, self.flat(n, 0.5), False, self.RATE)
+        self.assertTrue(np.allclose(y[:n // 3], x[:n // 3], atol=1e-6))
+
+    def test_named_out_sweep_closes_over_the_second_half(self):
+        c = render._named_filter_curve(np, 1000, "high pass filter out", "out")
+        self.assertAlmostEqual(float(c[400]), 0.5)
+        self.assertAlmostEqual(float(c[-1]), 1.0)
+
+    def test_named_in_sweep_is_open_by_the_midpoint(self):
+        c = render._named_filter_curve(np, 1000, "low pass filter in", "in")
+        self.assertAlmostEqual(float(c[0]), 0.0)
+        self.assertAlmostEqual(float(c[500]), 0.5)
+        self.assertAlmostEqual(float(c[-1]), 0.5)
+
+    def test_build_moves_no_longer_folds_the_filter_into_the_eq(self):
+        """It used to, so every rebuilt filter was applied twice."""
+        ing = {"filter": {"value": "high pass filter out", "off": False},
+               "volume": {"value": "overlap", "off": False}}
+        out, _ = render.build_moves(np, 1000, ing)
         self.assertTrue(np.allclose(out.low, 1.0))
-        self.assertTrue(np.allclose(inc.high, 1.0))
+
+
+class EffectTailTest(unittest.TestCase):
+    RATE = 44100
+
+    def test_the_tail_rings_on_past_the_blend(self):
+        n = self.RATE * 2
+        dry = np.random.default_rng(3).standard_normal((n, 2)).astype(np.float32) * 0.1
+        ing = {"effects": {"value": "reverb cut end", "off": False}}
+        tail = render.effect_tail(np, dry, None, ing, 120, self.RATE)
+        self.assertGreater(len(tail), n + self.RATE)
+        after = tail[n + self.RATE // 10: n + self.RATE // 2]
+        self.assertGreater(float(np.abs(after).mean()), 1e-4)
+
+    def test_an_echo_repeats_on_the_beat_fraction(self):
+        n = self.RATE
+        dry = np.zeros((n, 2), dtype=np.float32)
+        dry[-100] = 1.0                       # one click near the end of the blend
+        ing = {"effects": {"value": "echo 1/2 out end", "off": False}}
+        tail = render.effect_tail(np, dry, None, ing, 120, self.RATE)
+        half_beat = int(0.25 * self.RATE)
+        first = int(np.argmax(np.abs(tail[:, 0]) > 0.05))
+        self.assertAlmostEqual(first, n - 100 + half_beat, delta=30)
+
+    def test_no_effect_means_no_tail(self):
+        dry = np.ones((4096, 2), dtype=np.float32)
+        self.assertIsNone(render.effect_tail(np, dry, None, {}, 120, self.RATE))
 
 
 class FakeEntry:
@@ -238,6 +337,37 @@ class PlanTest(unittest.TestCase):
         segments, _ = self.plan(offset=1_500)
         self.assertEqual(segments[0].start_ms, 1_500)
         self.assertEqual(segments[0].end_ms, 106_500)
+
+    def test_close_tempi_are_matched_across_the_blend(self):
+        """Spotify plays the incoming track at the outgoing tempo while they
+        overlap; the slice is shorter or longer in the mix by that much."""
+        ts = self.transitions()
+        ts[0].from_track.bpm, ts[0].to_track.bpm = 121, 125
+        entries = {t: FakeEntry() for t in ("A", "B", "C")}
+        real = render.load_duration_ms
+        render.load_duration_ms = lambda p: 120_000
+        try:
+            segments, _ = render.plan(ts, lambda t: entries[t.title])
+        finally:
+            render.load_duration_ms = real
+        b = segments[1]
+        self.assertAlmostEqual(b.head_ratio, 121 / 125)
+        self.assertEqual(b.head_ms, 5_000)
+        self.assertAlmostEqual(b.length_ms, 94_000 - 5_000 * 121 / 125 + 5_000, delta=1)
+
+    def test_far_apart_tempi_are_left_alone(self):
+        ts = self.transitions()
+        ts[0].from_track.bpm, ts[0].to_track.bpm = 89, 121
+        self.assertEqual(render.tempo_ratio(ts[0]), 1.0)
+
+    def test_the_players_overlap_wins_over_the_editors(self):
+        class Auto:
+            overlap_ms = 14_548
+            incoming = type("S", (), {"duration_ms": 14_772})()
+        t = self.transitions()[0]
+        t.overlap_ms, t.automation = 13_997, Auto()
+        self.assertEqual(render.overlap_of(t), 14_548)
+        self.assertAlmostEqual(render.tempo_ratio(t), 14_772 / 14_548)
 
     def test_wrong_edits_are_reported(self):
         _, report = self.plan(wrong=True)
@@ -302,6 +432,34 @@ class NormalizeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LimitTest(unittest.TestCase):
+    RATE = 44100
+
+    def signal(self):
+        t = np.arange(self.RATE * 4) / self.RATE
+        x = (0.4 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)[:, None] * np.ones(
+            (1, 2), np.float32)
+        x[self.RATE * 2:self.RATE * 2 + 2000] *= 4.0       # one hot moment
+        return x
+
+    def test_peaks_are_held_under_the_ceiling(self):
+        y, peak = render.limit(self.signal(), rate=self.RATE, chunk_s=1.0)
+        self.assertGreater(peak, 1.0)
+        self.assertLessEqual(float(np.abs(y).max()), render.LIMIT_CEILING + 1e-6)
+
+    def test_only_the_hot_moment_is_turned_down(self):
+        """Scaling the whole mix by its peak cost the last render 8 dB."""
+        x = self.signal()
+        y, _ = render.limit(x.copy(), rate=self.RATE, chunk_s=1.0)
+        self.assertTrue(np.allclose(y[:self.RATE], x[:self.RATE]))
+        self.assertTrue(np.allclose(y[-self.RATE:], x[-self.RATE:]))
+
+    def test_a_quiet_mix_is_left_alone(self):
+        x = np.full((1000, 2), 0.3, dtype=np.float32)
+        y, _ = render.limit(x.copy())
+        self.assertTrue(np.allclose(y, 0.3))
 
 
 class SplitTest(unittest.TestCase):
@@ -402,6 +560,23 @@ class RollTest(unittest.TestCase):
         src = self.signal(seconds=3.0)
         self.assertEqual(len(render.apply_roll(np, src, 700, 44100)), len(src))
 
+    def test_the_held_beat_is_the_one_before_the_out_point(self):
+        """Suavemente's roll caught the beat after "mente" and repeated "eh"."""
+        rate = 44100
+        src = self.signal(seconds=6.0, rate=rate)
+        before, chunk = src[:3 * rate], src[3 * rate:]
+        out = render.apply_roll(np, chunk, 500, rate, before=before)
+        self.assertEqual(len(out), len(chunk))
+        held = before[-rate // 2:]
+        self.assertTrue(np.allclose(out[rate // 2 + 400:rate], held[400:], atol=1e-6))
+
+    def test_the_first_repeat_joins_the_out_point_without_a_step(self):
+        rate = 44100
+        src = self.signal(seconds=6.0, rate=rate)
+        before, chunk = src[:3 * rate], src[3 * rate:]
+        out = render.apply_roll(np, chunk, 500, rate, before=before)
+        self.assertLess(float(np.abs(out[0] - before[-1]).max()), 0.05)
+
 
 class RollLengthTest(unittest.TestCase):
     """How long the roll is, and which track's tempo sets it."""
@@ -473,6 +648,19 @@ class LoudnessTest(unittest.TestCase):
                                render.measure_loudness(with_intro, self.RATE),
                                delta=1.5)
 
+    def test_the_standards_reference_tone_reads_right(self):
+        """A full-scale 997 Hz sine in one channel is -3.01 LUFS by definition.
+        The shelf used before read bass-heavy tracks 8 dB hot."""
+        t = np.arange(self.RATE * 5) / self.RATE
+        x = np.zeros((len(t), 2), dtype=np.float32)
+        x[:, 0] = np.sin(2 * np.pi * 997 * t)
+        self.assertAlmostEqual(render.measure_loudness(x, self.RATE), -3.01, delta=0.1)
+
+    def test_bass_does_not_read_louder_than_it_is(self):
+        mid = render.measure_loudness(self.tone(0.3, hz=1000.0), self.RATE)
+        bass = render.measure_loudness(self.tone(0.3, hz=60.0), self.RATE)
+        self.assertLess(bass, mid)
+
     def test_db_to_gain(self):
         self.assertAlmostEqual(render.db_to_gain(0.0), 1.0)
         self.assertAlmostEqual(render.db_to_gain(6.0), 2.0, places=2)
@@ -495,14 +683,17 @@ class LoudnessTrimTest(unittest.TestCase):
             render.measure_loudness, render.load_audio = real_measure, real_load
 
     def test_the_target_is_the_median_so_moves_stay_small(self):
-        trims = self.trims({"a.mp3": -10.0, "b.mp3": -5.0, "c.mp3": 0.0})
+        trims = self.trims({"a.mp3": -17.0, "b.mp3": -12.0, "c.mp3": -7.0})
         self.assertAlmostEqual(trims["b.mp3"], 0.0)       # the median moves not at all
         self.assertAlmostEqual(trims["a.mp3"], 5.0)       # quiet one comes up
         self.assertAlmostEqual(trims["c.mp3"], -5.0)      # loud one comes down
 
+    def test_a_loud_playlist_is_brought_down_to_leave_room_for_blends(self):
+        trims = self.trims({"a.mp3": -7.0, "b.mp3": -6.0, "c.mp3": -5.0})
+        self.assertAlmostEqual(trims["b.mp3"], render.MIX_LUFS + 6.0)
+
     def test_the_quiet_outlier_is_lifted(self):
-        """Temperature measured 10.2 dB below this playlist's median."""
-        trims = self.trims({"temperature.mp3": -10.9, "b.mp3": -0.7, "c.mp3": 3.7})
+        trims = self.trims({"temperature.mp3": -20.9, "b.mp3": -10.7, "c.mp3": -6.3})
         self.assertGreater(trims["temperature.mp3"], 9.0)
 
     def test_a_trim_is_capped(self):
